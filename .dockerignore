@@ -1,0 +1,7 @@
+.git
+.gitignore
+.ruff_cache
+screenshots
+Dockerfile
+.dockerignore
+README.md
