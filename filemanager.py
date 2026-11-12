@@ -1178,7 +1178,11 @@ html[data-theme="dark"] #makeBtn[aria-pressed="false"]{color:#7fe9ff;border-colo
 .menu-item .icon{font-size:16px}
 main{position:relative;z-index:1;padding:18px}
 .meta{color:var(--muted);font-size:12px;margin:0 2px 10px}
-.list{width:100%;border-collapse:separate;border-spacing:0;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.list-wrap{position:relative;isolation:isolate;overflow:hidden;border-radius:var(--radius);background:var(--panel);border:1px solid var(--border);box-shadow:var(--shadow)}
+/* Hover highlight: one pre-painted layer translated over the hovered row, so
+   moving the mouse over the listing never triggers a row repaint. */
+.row-hl{position:absolute;left:0;right:0;top:0;height:0;z-index:-1;pointer-events:none;background:var(--hover);will-change:transform;transform:translateY(-9999px)}
+.list{width:100%;border-collapse:separate;border-spacing:0;background:transparent}
 .list th{background:var(--th-bg);text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding:11px 14px;border-bottom:1px solid var(--border)}
 .list th.sortable{cursor:pointer;user-select:none}
 .list th.sortable:hover{color:var(--text)}
@@ -1187,7 +1191,6 @@ main{position:relative;z-index:1;padding:18px}
 .list td{padding:10px 14px;border-bottom:1px solid var(--border)}
 .list tbody tr:last-child td{border-bottom:0}
 .list tbody tr.row{cursor:pointer}
-.list tbody tr.row:hover{background:var(--hover)}
 .list tbody tr.up td{color:var(--muted)}
 .c-size,.c-acts{text-align:right}
 .c-created,.c-mtime{white-space:nowrap}
@@ -1320,7 +1323,7 @@ html[data-theme="light"] header{
   border-bottom:1px solid #d9c89a;
   box-shadow:inset 0 -1px 0 rgba(255,255,255,.8),0 4px 16px rgba(120,90,40,.10);
 }
-html[data-theme="light"] .list{
+html[data-theme="light"] .list-wrap{
   border-color:#e2d3ab;background-color:rgba(253,248,230,.74);
   -webkit-backdrop-filter:blur(8px) saturate(105%);backdrop-filter:blur(8px) saturate(105%);
   background-image:
@@ -1331,7 +1334,7 @@ html[data-theme="light"] .list{
 }
 html[data-theme="light"] .list th{color:#8a7b5e;border-bottom:1px solid #d9c89a;background:rgba(246,238,212,.72)}
 html[data-theme="light"] .list td{border-bottom:1px solid rgba(130,160,190,.20)}
-html[data-theme="light"] .list tbody tr.row:hover{background:#f6eed4}
+html[data-theme="light"] .row-hl{background:#f6eed4}
 html[data-theme="light"] .modal{
   background-color:#fdf8e6;
   background-image:radial-gradient(circle at 20% 30%,rgba(170,140,80,.04) 0 1px,transparent 1px);
@@ -1483,8 +1486,8 @@ html[data-theme="dark"] header{
   border-bottom:1px solid rgba(0,229,255,.50);
   box-shadow:0 0 20px rgba(0,229,255,.22),0 1px 0 rgba(120,248,255,.35),inset 0 -1px 18px rgba(0,229,255,.06);
 }
-html[data-theme="dark"] .list,html[data-theme="dark"] .modal,html[data-theme="dark"] .menu,html[data-theme="dark"] .tree{-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
-html[data-theme="dark"] .list{border-radius:2px;background-color:rgba(3,14,20,.74);border-color:rgba(0,229,255,.35);box-shadow:0 0 0 1px rgba(0,229,255,.06),0 0 24px rgba(0,229,255,.12),0 20px 50px rgba(0,0,0,.7)}
+html[data-theme="dark"] .list-wrap,html[data-theme="dark"] .modal,html[data-theme="dark"] .menu,html[data-theme="dark"] .tree{-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+html[data-theme="dark"] .list-wrap{border-radius:2px;background-color:rgba(3,14,20,.74);border-color:rgba(0,229,255,.35);box-shadow:0 0 0 1px rgba(0,229,255,.06),0 0 24px rgba(0,229,255,.12),0 20px 50px rgba(0,0,0,.7)}
 html[data-theme="dark"] .modal{border-radius:4px;border:1px solid rgba(0,229,255,.45);box-shadow:0 0 0 1px rgba(0,229,255,.10),0 0 40px rgba(0,229,255,.18),0 30px 80px rgba(0,0,0,.8)}
 html[data-theme="dark"] .modal-head{border-bottom:1px solid rgba(0,229,255,.30);background:rgba(0,229,255,.04)}
 html[data-theme="dark"] .modal-title{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.06em;color:#c9fbff}
@@ -1504,8 +1507,7 @@ html[data-theme="dark"] .btn:hover{background:rgba(0,229,255,.12);border-color:r
 html[data-theme="dark"] .btn-primary{background:linear-gradient(180deg,#00e5ff,#00a8c8);border-color:#7df4ff;color:#001014;text-shadow:none;box-shadow:0 0 14px rgba(0,229,255,.55),0 0 34px rgba(0,229,255,.25)}
 html[data-theme="dark"] .btn-primary:hover{background:linear-gradient(180deg,#5cf2ff,#00c8e8);box-shadow:0 0 20px rgba(0,229,255,.8),0 0 50px rgba(0,229,255,.4)}
 html[data-theme="dark"] .act:hover{background:rgba(0,229,255,.14);border-color:rgba(0,229,255,.55);box-shadow:0 0 12px rgba(0,229,255,.45)}
-html[data-theme="dark"] .list tbody tr.row:hover{background:linear-gradient(90deg,rgba(0,229,255,.14),rgba(0,229,255,.03))}
-html[data-theme="dark"] .list tbody tr.row:hover td:first-child{box-shadow:inset 2px 0 0 var(--primary)}
+html[data-theme="dark"] .row-hl{background:linear-gradient(90deg,rgba(0,229,255,.14),rgba(0,229,255,.03));border-left:2px solid var(--primary)}
 html[data-theme="dark"] .menu{border-radius:3px;border-color:rgba(0,229,255,.40);box-shadow:0 0 24px rgba(0,229,255,.18),0 14px 40px rgba(0,0,0,.7)}
 html[data-theme="dark"] .menu-item{border-radius:2px}
 html[data-theme="dark"] .menu-item:hover{background:rgba(0,229,255,.12);box-shadow:inset 2px 0 0 var(--primary)}
@@ -1609,18 +1611,21 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
 </header>
 <main>
   <div class="meta" id="meta"></div>
-  <table class="list">
-    <thead>
-      <tr>
-        <th class="sortable" data-sort="name">Name<span class="si"></span></th>
-        <th class="c-size sortable" data-sort="size">Size<span class="si"></span></th>
-        <th class="c-created sortable" data-sort="ctime">Created<span class="si"></span></th>
-        <th class="c-mtime sortable" data-sort="mtime">Last updated<span class="si"></span></th>
-        <th class="c-acts">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
+  <div class="list-wrap">
+    <div class="row-hl" aria-hidden="true"></div>
+    <table class="list">
+      <thead>
+        <tr>
+          <th class="sortable" data-sort="name">Name<span class="si"></span></th>
+          <th class="c-size sortable" data-sort="size">Size<span class="si"></span></th>
+          <th class="c-created sortable" data-sort="ctime">Created<span class="si"></span></th>
+          <th class="c-mtime sortable" data-sort="mtime">Last updated<span class="si"></span></th>
+          <th class="c-acts">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
   <div class="empty" id="empty" hidden>This folder is empty.</div>
 </main>
 
@@ -1640,6 +1645,26 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
 const ROOT_NAME = __ROOT_NAME__;
 const $ = s => document.querySelector(s);
 const rows = $("#rows"), crumbs = $("#crumbs");
+
+// Row hover highlight: a pre-painted layer (.row-hl) is moved with transform
+// over the hovered row, so sweeping the mouse over the listing never triggers
+// a row repaint (which used to dominate CPU on every mouse move).
+{
+  const hl = $(".row-hl");
+  if (hl && rows) {
+    const table = rows.closest("table");
+    const hideHl = () => { hl.style.transform = "translateY(-9999px)"; };
+    rows.addEventListener("mouseover", ev => {
+      const r = ev.target.closest("tr.row");
+      if (!r) { hideHl(); return; }
+      const rect = r.getBoundingClientRect(), top = table.getBoundingClientRect();
+      const h = Math.round(rect.height);
+      if (hl.style.height !== h + "px") hl.style.height = h + "px";
+      hl.style.transform = "translateY(" + Math.round(rect.top - top.top) + "px)";
+    });
+    rows.addEventListener("mouseleave", hideHl);
+  }
+}
 const state = { path: "", parent: null, entries: [], sizes: {}, sizesLoaded: false,
                 sort: { key: "name", dir: 1 } };
 
