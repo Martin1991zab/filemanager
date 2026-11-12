@@ -1369,19 +1369,17 @@ html[data-theme="dark"]{
   color-scheme:dark;
 }
 #stars{display:none}
-html[data-theme="dark"] #stars{display:block;position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;animation:starsIn .6s ease}
+html[data-theme="dark"] #stars{display:block;position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
 #stars::before{content:"";position:absolute;inset:-25%;background:
   radial-gradient(45% 38% at 16% 10%,rgba(0,200,235,.14),transparent 70%),
   radial-gradient(38% 34% at 84% 6%,rgba(255,45,120,.07),transparent 70%),
   radial-gradient(60% 45% at 50% 108%,rgba(0,140,190,.12),transparent 72%);
   filter:blur(18px)}
 #stars::after{content:"";position:absolute;inset:-2px;background-image:linear-gradient(rgba(0,229,255,.10) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,255,.10) 1px,transparent 1px);background-size:64px 64px;opacity:.5;-webkit-mask-image:radial-gradient(ellipse at 50% 35%,#000 10%,transparent 72%);mask-image:radial-gradient(ellipse at 50% 35%,#000 10%,transparent 72%)}
-.star{position:absolute;border-radius:50%;background:#d8fbff;box-shadow:0 0 4px rgba(0,229,255,.65);animation:twinkle var(--tw,4s) ease-in-out infinite;animation-delay:var(--td,0s);will-change:opacity,transform}
+.star{position:absolute;border-radius:50%;background:#d8fbff;box-shadow:0 0 4px rgba(0,229,255,.65)}
 .star:nth-child(5n){background:#a9f7ff}
 .star:nth-child(11n){background:#ffb3d4;box-shadow:0 0 5px rgba(255,45,120,.55)}
 .star.big{box-shadow:0 0 7px 1px rgba(0,229,255,.9),0 0 18px 2px rgba(0,229,255,.35)}
-@keyframes twinkle{0%,100%{opacity:var(--o,.8);transform:scale(1)}50%{opacity:.10;transform:scale(.55)}}
-@keyframes starsIn{from{opacity:0}to{opacity:1}}
 
 /* ---- Dark theme: space-station view over Earth ---- */
 #space{display:none}
@@ -1395,7 +1393,6 @@ html[data-theme="dark"] #space .sun{
     0 0 44px 14px rgba(80,235,255,.50),
     0 0 120px 55px rgba(0,190,245,.28),
     0 0 260px 130px rgba(0,120,200,.14);
-  animation:sunPulse 9s ease-in-out infinite;
 }
 html[data-theme="dark"] #space .sun::before{
   content:"";position:absolute;left:38%;right:38%;top:-340%;bottom:-340%;
@@ -1407,7 +1404,6 @@ html[data-theme="dark"] #space .sun::after{
   background:linear-gradient(90deg,transparent,rgba(170,248,255,.30) 50%,transparent);
   filter:blur(3px);
 }
-@keyframes sunPulse{0%,100%{opacity:.92;transform:scale(1)}50%{opacity:1;transform:scale(1.03)}}
 html[data-theme="dark"] #space .earth{
   position:absolute;left:50%;top:63%;width:250vw;height:250vw;transform:translateX(-50%);
   border-radius:50%;overflow:hidden;
@@ -1534,12 +1530,6 @@ html[data-theme="dark"] .bar-fill{background:linear-gradient(90deg,#00a8c8,#00e5
 html[data-theme="dark"] #themeBtn{color:var(--primary);font-size:18px;text-shadow:0 0 8px rgba(0,229,255,.9),0 0 20px rgba(0,229,255,.5)}
 html[data-theme="dark"] *{scrollbar-color:rgba(0,229,255,.55) rgba(1,8,12,.7)}
 html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
-@media(prefers-reduced-motion:reduce){
-  .star{animation:none}
-  html[data-theme="dark"] #stars{animation:none}
-  html[data-theme="dark"] #space .sun{animation:none}
-}
-
 @media(max-width:640px){.hide-sm{display:none}main{padding:12px}.name{max-width:55vw}}
 </style>
 </head>
@@ -2398,9 +2388,8 @@ function buildStars(){
     s.style.left = (Math.random()*100).toFixed(2) + "%";
     s.style.top = (Math.random()*100).toFixed(2) + "%";
     s.style.width = s.style.height = size.toFixed(2) + "px";
-    s.style.setProperty("--tw", (2.6 + Math.random()*5).toFixed(2) + "s");
-    s.style.setProperty("--td", (-Math.random()*9).toFixed(2) + "s");
-    s.style.setProperty("--o", (0.35 + Math.random()*0.65).toFixed(2));
+    // Static brightness varies per star so the field doesn't look uniform.
+    s.style.opacity = (0.35 + Math.random()*0.65).toFixed(2);
     frag.appendChild(s);
   }
   box.appendChild(frag);
