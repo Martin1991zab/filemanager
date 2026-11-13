@@ -17,10 +17,10 @@ edited, uploaded or deleted (a popup shows the result once the build
 finishes); the "Auto-make" toggle in the header turns that off (the
 choice is kept in the browser's localStorage, so the server stays
 stateless). The "Make" button runs `make` in the current folder on
-demand and waits for the result. Shell access, executable execution, and
-make (both the automatic rebuilds and the manual Make button) can each be
-disabled entirely at startup with the --no-shell, --no-run and --no-make
-flags.
+demand and waits for the result. Shell access, executable execution, make
+(both the automatic rebuilds and the manual Make button) and the base64
+upload/download workaround can each be disabled entirely at startup with
+the --no-shell, --no-run, --no-make and --no-b64 flags.
 
 Everything is stateless: it serves the directory the app was started in
 (or a path passed as the first argument) and stores no config, database,
@@ -29,7 +29,7 @@ reverse proxy (there is none here).
 
 Run:
     python filemanager.py [directory] [--host HOST] [--port PORT]
-                            [--no-shell] [--no-run] [--no-make]
+                            [--no-shell] [--no-run] [--no-make] [--no-b64]
 
 Uses only the Python standard library, plus (optionally) Pillow for image
 thumbnails. If Pillow is missing, the app still works — it just shows a
@@ -220,6 +220,7 @@ ROOT: Path = Path.cwd().resolve()
 ENABLE_SHELL: bool = True  # Shell button / /api/shell
 ENABLE_RUN: bool = True  # run executables / /api/run
 ENABLE_MAKE: bool = True  # automatic rebuilds + manual Make button
+ENABLE_B64: bool = True  # base64 upload/download (/api/upload64, /api/download64)
 
 # Parsed query string, as returned by urllib.parse.parse_qs.
 Qs = dict[str, list[str]]
@@ -754,7 +755,12 @@ class Handler(BaseHTTPRequestHandler):
     def send_html(self) -> None:
         root_name = ROOT.name or str(ROOT)
         features = json.dumps(
-            {"shell": ENABLE_SHELL, "run": ENABLE_RUN, "make": ENABLE_MAKE}
+            {
+                "shell": ENABLE_SHELL,
+                "run": ENABLE_RUN,
+                "make": ENABLE_MAKE,
+                "b64": ENABLE_B64,
+            }
         )
         data = (
             HTML_TEMPLATE.replace(
@@ -1147,6 +1153,8 @@ class Handler(BaseHTTPRequestHandler):
     def ep_upload64(self, qs: Qs) -> None:
         """Receive a file as base64 in a JSON body (workaround for flaky
         binary uploads): {"data": "<base64>"}. A data-URL prefix is accepted."""
+        if not ENABLE_B64:
+            raise HTTPError(403, "Base64 upload is disabled (started with --no-b64)")
         dest_dir = safe_path(qs.get("path", [""])[0])
         if not dest_dir.is_dir():
             raise HTTPError(404, "Target folder not found")
@@ -1196,6 +1204,8 @@ class Handler(BaseHTTPRequestHandler):
         flat no matter how large the file is (the cap below still applies,
         because the browser holds the whole result in RAM as a Blob).
         """
+        if not ENABLE_B64:
+            raise HTTPError(403, "Base64 download is disabled (started with --no-b64)")
         p = self._file(qs)
         size = p.stat().st_size
         if size > MAX_B64_FILE_SIZE:
@@ -1952,7 +1962,7 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
     </div>
   </div>
   <label class="btn btn-primary">Upload<input type="file" id="files" multiple hidden></label>
-  <label class="btn" title="Upload as base64 (workaround for network problems)">Upload b64<input type="file" id="files64" multiple hidden></label>
+  <label class="btn" id="upload64Btn" title="Upload as base64 (workaround for network problems)">Upload b64<input type="file" id="files64" multiple hidden></label>
 </header>
 <main>
   <div class="meta" id="meta"></div>
@@ -1988,7 +1998,7 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
 
 <script>
 const ROOT_NAME = __ROOT_NAME__;
-const FEATURES = __FEATURES__;  // {shell, run, make} — set by the server at startup
+const FEATURES = __FEATURES__;  // {shell, run, make, b64} — set by the server at startup
 const $ = s => document.querySelector(s);
 const rows = $("#rows"), crumbs = $("#crumbs");
 
@@ -2175,7 +2185,7 @@ function actionsHTML(e){
     const vt = e.kind==="text" ? "Edit" : "View";
     h+='<button class="act" data-id="view" title="'+vt+'">'+vi+'</button>';
     h+='<button class="act" data-id="dl" title="Download">⬇</button>';
-    h+='<button class="act" data-id="dlb64" title="Download as base64 (workaround for network problems)">🔣</button>';
+    if(FEATURES.b64) h+='<button class="act" data-id="dlb64" title="Download as base64 (workaround for network problems)">🔣</button>';
   }
   h+='<button class="act" data-id="del" title="Delete">🗑</button>';
   return h;
@@ -2867,7 +2877,7 @@ window.addEventListener("storage", e => {
   if(e.key === MAKE_KEY){ autoMakeEnabled = storedAutoMake(); applyMakeState(); }
 });
 
-// -- Startup feature flags (--no-shell / --no-run / --no-make) ------------
+// -- Startup feature flags (--no-shell / --no-run / --no-make / --no-b64) --
 // The server enforces these too (the endpoints refuse with 403); this only
 // hides the corresponding UI so disabled features don't even appear.
 function applyFeatures(){
@@ -2875,6 +2885,7 @@ function applyFeatures(){
   hide("#shellBtn", FEATURES.shell);
   hide("#makeBtn", FEATURES.make);
   hide("#makeRunBtn", FEATURES.make);
+  hide("#upload64Btn", FEATURES.b64);
 }
 
 applyFeatures();
@@ -2892,7 +2903,7 @@ updateSortIndicators();
 # Entry point
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> None:
-    global ROOT, ENABLE_SHELL, ENABLE_RUN, ENABLE_MAKE
+    global ROOT, ENABLE_SHELL, ENABLE_RUN, ENABLE_MAKE, ENABLE_B64
     ap = argparse.ArgumentParser(
         description="Single-file web file manager (stdlib + optional Pillow)."
     )
@@ -2923,6 +2934,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="disable make entirely: no automatic rebuilds and no manual Make button",
     )
+    ap.add_argument(
+        "--no-b64",
+        action="store_true",
+        help="disable the base64 upload/download workaround (/api/upload64, /api/download64)",
+    )
     args = ap.parse_args(argv)
 
     root = Path(args.root or os.getcwd()).expanduser().resolve()
@@ -2932,6 +2948,7 @@ def main(argv: list[str] | None = None) -> None:
     ENABLE_SHELL = not args.no_shell
     ENABLE_RUN = not args.no_run
     ENABLE_MAKE = not args.no_make
+    ENABLE_B64 = not args.no_b64
     mimetypes.init()
 
     try:

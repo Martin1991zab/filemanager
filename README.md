@@ -44,7 +44,9 @@ project data.
 ### Uploading and downloading
 
 - Multi-file upload with a progress bar.
-- Base64 upload/download as a workaround for flaky networks.
+- Base64 upload/download as a workaround for flaky networks; can be
+  disabled entirely with `--no-b64` (the buttons disappear and the endpoints
+  refuse requests with a 403 error).
 - Download single files, or the current folder as a ZIP archive.
 - Extract ZIP archives into a folder, with an optional delete-after-extract.
 
@@ -97,8 +99,9 @@ python3 filemanager.py /path/to/folder
 # Bind to all interfaces on a custom port
 python3 filemanager.py /path/to/folder --host 0.0.0.0 --port 8080
 
-# Disable shell access, executable execution, and make (auto and manual)
-python3 filemanager.py /path/to/folder --no-shell --no-run --no-make
+# Disable shell access, executable execution, make (auto and manual)
+# and the base64 upload/download workaround
+python3 filemanager.py /path/to/folder --no-shell --no-run --no-make --no-b64
 ```
 
 Then open the printed URL in your browser.
@@ -113,6 +116,7 @@ Then open the printed URL in your browser.
 | `--no-shell` | off | Disable shell access (Shell button and `/api/shell`). |
 | `--no-run` | off | Disable execution of executable files (Run button and `/api/run`). |
 | `--no-make` | off | Disable make entirely: no automatic rebuilds and no manual Make button (`/api/make`). |
+| `--no-b64` | off | Disable the base64 upload/download workaround (`/api/upload64`, `/api/download64`). |
 
 ## Security
 
