@@ -17,7 +17,10 @@ edited, uploaded or deleted (a popup shows the result once the build
 finishes); the "Auto-make" toggle in the header turns that off (the
 choice is kept in the browser's localStorage, so the server stays
 stateless). The "Make" button runs `make` in the current folder on
-demand and waits for the result.
+demand and waits for the result. Shell access, executable execution, and
+make (both the automatic rebuilds and the manual Make button) can each be
+disabled entirely at startup with the --no-shell, --no-run and --no-make
+flags.
 
 Everything is stateless: it serves the directory the app was started in
 (or a path passed as the first argument) and stores no config, database,
@@ -26,6 +29,7 @@ reverse proxy (there is none here).
 
 Run:
     python filemanager.py [directory] [--host HOST] [--port PORT]
+                            [--no-shell] [--no-run] [--no-make]
 
 Uses only the Python standard library, plus (optionally) Pillow for image
 thumbnails. If Pillow is missing, the app still works — it just shows a
@@ -210,6 +214,11 @@ TEXT_MIME_TYPES = {
 
 # The directory the whole app is locked to (set in main()).
 ROOT: Path = Path.cwd().resolve()
+
+# Feature toggles, set from the command line in main().
+ENABLE_SHELL: bool = True  # Shell button / /api/shell
+ENABLE_RUN: bool = True  # run executables / /api/run
+ENABLE_MAKE: bool = True  # automatic rebuilds + manual Make button
 
 
 class HTTPError(Exception):
@@ -717,9 +726,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_html(self):
         root_name = ROOT.name or str(ROOT)
-        data = HTML_TEMPLATE.replace(
-            "__ROOT_NAME__", json.dumps(root_name, ensure_ascii=False)
-        ).encode("utf-8")
+        features = json.dumps(
+            {"shell": ENABLE_SHELL, "run": ENABLE_RUN, "make": ENABLE_MAKE}
+        )
+        data = (
+            HTML_TEMPLATE.replace(
+                "__ROOT_NAME__", json.dumps(root_name, ensure_ascii=False)
+            )
+            .replace("__FEATURES__", features)
+            .encode("utf-8")
+        )
         self._send(
             200,
             data,
@@ -774,7 +790,7 @@ class Handler(BaseHTTPRequestHandler):
         which the client polls via /api/make/result until the build
         finishes. Returns None when nothing needs to be built.
         """
-        if self.auto_make_disabled():
+        if not ENABLE_MAKE or self.auto_make_disabled():
             return None
         if not (dirp / "Makefile").is_file():
             return None
@@ -884,7 +900,7 @@ class Handler(BaseHTTPRequestHandler):
                         "ctime": created_time(st),
                         "mtime": st.st_mtime,
                         "thumb": is_reg and ext in THUMB_EXTS,
-                        "run": is_reg and is_executable(de.path, st),
+                        "run": ENABLE_RUN and is_reg and is_executable(de.path, st),
                     }
                 )
         entries.sort(key=lambda e: (e["kind"] != "dir", e["name"].lower()))
@@ -1220,6 +1236,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def ep_run(self, qs):
         """Execute an executable file, capturing output (with timeout)."""
+        if not ENABLE_RUN:
+            raise HTTPError(403, "Executing files is disabled (started with --no-run)")
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot run the root directory")
@@ -1252,6 +1270,8 @@ class Handler(BaseHTTPRequestHandler):
         Unlike the automatic runs, this ignores the client's auto-make
         preference: the user explicitly asked for it.
         """
+        if not ENABLE_MAKE:
+            raise HTTPError(403, "Make is disabled (started with --no-make)")
         body = self._read_body()
         try:
             payload = json.loads(body.decode("utf-8")) if body else {}
@@ -1282,6 +1302,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def ep_shell(self, qs):
         """Run an arbitrary command through the configured shell (bash -c)."""
+        if not ENABLE_SHELL:
+            raise HTTPError(403, "Shell access is disabled (started with --no-shell)")
         body = self._read_body()
         try:
             payload = json.loads(body.decode("utf-8")) if body else {}
@@ -1939,6 +1961,7 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
 
 <script>
 const ROOT_NAME = __ROOT_NAME__;
+const FEATURES = __FEATURES__;  // {shell, run, make} — set by the server at startup
 const $ = s => document.querySelector(s);
 const rows = $("#rows"), crumbs = $("#crumbs");
 
@@ -2817,6 +2840,17 @@ window.addEventListener("storage", e => {
   if(e.key === MAKE_KEY){ autoMakeEnabled = storedAutoMake(); applyMakeState(); }
 });
 
+// -- Startup feature flags (--no-shell / --no-run / --no-make) ------------
+// The server enforces these too (the endpoints refuse with 403); this only
+// hides the corresponding UI so disabled features don't even appear.
+function applyFeatures(){
+  const hide = (sel, on) => { const el=$(sel); if(el && !on) el.style.display="none"; };
+  hide("#shellBtn", FEATURES.shell);
+  hide("#makeBtn", FEATURES.make);
+  hide("#makeRunBtn", FEATURES.make);
+}
+
+applyFeatures();
 applyMakeState();
 applyTheme();
 load("");
@@ -2831,7 +2865,7 @@ updateSortIndicators();
 # Entry point
 # ---------------------------------------------------------------------------
 def main(argv=None):
-    global ROOT
+    global ROOT, ENABLE_SHELL, ENABLE_RUN, ENABLE_MAKE
     ap = argparse.ArgumentParser(
         description="Single-file web file manager (stdlib + optional Pillow)."
     )
@@ -2847,12 +2881,30 @@ def main(argv=None):
         help="bind address (default: 127.0.0.1; use 0.0.0.0 for a remote reverse proxy)",
     )
     ap.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
+    ap.add_argument(
+        "--no-shell",
+        action="store_true",
+        help="disable shell access (Shell button, /api/shell)",
+    )
+    ap.add_argument(
+        "--no-run",
+        action="store_true",
+        help="disable execution of executable files (Run button, /api/run)",
+    )
+    ap.add_argument(
+        "--no-make",
+        action="store_true",
+        help="disable make entirely: no automatic rebuilds and no manual Make button",
+    )
     args = ap.parse_args(argv)
 
     root = Path(args.root or os.getcwd()).expanduser().resolve()
     if not root.is_dir():
         ap.error(f"not a directory: {root}")
     ROOT = root
+    ENABLE_SHELL = not args.no_shell
+    ENABLE_RUN = not args.no_run
+    ENABLE_MAKE = not args.no_make
     mimetypes.init()
 
     try:

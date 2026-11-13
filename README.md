@@ -60,6 +60,10 @@ project data.
   is shown in a modal. The **Auto-make** toggle in the header disables this
   (the choice is stored in the browser and survives restarts); the manual
   **Make** button always runs regardless of that toggle.
+- Any of the three can be disabled entirely at startup with `--no-shell`,
+  `--no-run` or `--no-make` (the last one turns off both the automatic
+  rebuilds and the manual Make button). Disabled features are hidden in the
+  UI and their endpoints refuse requests with a 403 error.
 
 ### Themes
 
@@ -92,6 +96,9 @@ python3 filemanager.py /path/to/folder
 
 # Bind to all interfaces on a custom port
 python3 filemanager.py /path/to/folder --host 0.0.0.0 --port 8080
+
+# Disable shell access, executable execution, and make (auto and manual)
+python3 filemanager.py /path/to/folder --no-shell --no-run --no-make
 ```
 
 Then open the printed URL in your browser.
@@ -103,6 +110,9 @@ Then open the printed URL in your browser.
 | `root` | current directory | Directory to serve. |
 | `--host` | `127.0.0.1` | Address to bind. Use `0.0.0.0` only behind a reverse proxy or firewall. |
 | `--port` | `8000` | Port to listen on. |
+| `--no-shell` | off | Disable shell access (Shell button and `/api/shell`). |
+| `--no-run` | off | Disable execution of executable files (Run button and `/api/run`). |
+| `--no-make` | off | Disable make entirely: no automatic rebuilds and no manual Make button (`/api/make`). |
 
 ## Security
 
@@ -113,7 +123,9 @@ network:
   port can read, write, rename and delete files under the served root.
 - The **Run** and **Shell** features execute arbitrary commands with the
   permissions of the user running the server. Treat access to this app as
-  equivalent to a shell account.
+  equivalent to a shell account. To reduce the exposure, start the server
+  with `--no-run`, `--no-shell` and/or `--no-make` to remove the command
+  execution features entirely.
 - The server refuses paths outside the served root, but that is not a
   substitute for access control.
 - For remote access, bind to localhost and put the app behind an
