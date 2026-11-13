@@ -56,6 +56,7 @@ import uuid
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, BinaryIO, TypedDict
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import zipfile
 import zlib
@@ -220,6 +221,22 @@ ENABLE_SHELL: bool = True  # Shell button / /api/shell
 ENABLE_RUN: bool = True  # run executables / /api/run
 ENABLE_MAKE: bool = True  # automatic rebuilds + manual Make button
 
+# Parsed query string, as returned by urllib.parse.parse_qs.
+Qs = dict[str, list[str]]
+
+# Thumbnail cache key/value: (path, mtime_ns, size) -> (etag, content-type, data).
+ThumbKey = tuple[Path, int, int]
+ThumbVal = tuple[str, str, bytes]
+
+
+# Shape of a captured command/make result (used by run, shell and auto-make).
+class RunResult(TypedDict):
+    code: int | None
+    timed_out: bool
+    truncated: bool
+    output: str
+    cwd: str
+
 
 class HTTPError(Exception):
     def __init__(self, code: int, msg: str):
@@ -282,7 +299,7 @@ def detect_newline(data: bytes) -> str:
     return kinds[0]
 
 
-def created_time(st) -> float:
+def created_time(st: os.stat_result) -> float:
     """Best-effort creation time for a stat result.
 
     Uses st_birthtime where the platform exposes it (macOS, BSD, Windows);
@@ -293,7 +310,7 @@ def created_time(st) -> float:
     return birth if birth else st.st_ctime
 
 
-def is_executable(p: Path, st=None) -> bool:
+def is_executable(p: Path, st: os.stat_result | None = None) -> bool:
     """True if p is a regular file the current user can execute.
 
     Pass the stat result when one is already at hand (e.g. from a
@@ -316,7 +333,9 @@ def is_executable(p: Path, st=None) -> bool:
     return True
 
 
-def _run_captured(argv, cwd, timeout, max_out):
+def _run_captured(
+    argv: list[str], cwd: Path, timeout: int, max_out: int
+) -> tuple[int | None, bool, bool, str, str]:
     """Run argv in cwd, capture combined stdout+stderr, and kill the whole
     process group on timeout.
 
@@ -389,7 +408,7 @@ def _run_captured(argv, cwd, timeout, max_out):
     return code, timed_out, truncated, text, cwd_rel
 
 
-def run_executable(p: Path, args, timeout: int, max_out: int) -> dict:
+def run_executable(p: Path, args: list[str], timeout: int, max_out: int) -> RunResult:
     """Run p in its own directory, capturing combined stdout+stderr."""
     code, timed_out, truncated, text, cwd_rel = _run_captured(
         [str(p)] + args, p.parent, timeout, max_out
@@ -403,7 +422,7 @@ def run_executable(p: Path, args, timeout: int, max_out: int) -> dict:
     }
 
 
-def run_make_if_present(dirp: Path):
+def run_make_if_present(dirp: Path) -> RunResult | None:
     """Run MAKE_CMD in dirp if it contains a Makefile.
 
     Automatic rebuild hook after edits/uploads. Uses the same capture,
@@ -436,14 +455,18 @@ class _MakeJobs:
     blocking make per file.
     """
 
-    def __init__(self, ttl: float):
+    def __init__(self, ttl: float) -> None:
         self._lock = threading.Lock()
-        self._results = OrderedDict()  # job id -> [created, done, result]
-        self._queues = {}  # directory (str) -> [job ids] awaiting a build
-        self._active = set()  # directories with a build running
+        self._results: OrderedDict[str, Any] = (
+            OrderedDict()
+        )  # job id -> [created, done, result]
+        self._queues: dict[
+            str, list[str]
+        ] = {}  # directory (str) -> [job ids] awaiting a build
+        self._active: set[str] = set()  # directories with a build running
         self._ttl = ttl
 
-    def _sweep(self):
+    def _sweep(self) -> None:
         now = time.monotonic()
         for k in [k for k, (t, _d, _r) in self._results.items() if now - t > self._ttl]:
             del self._results[k]
@@ -461,7 +484,7 @@ class _MakeJobs:
             self._build(d)
         return job
 
-    def _build(self, d: str):
+    def _build(self, d: str) -> None:
         with self._lock:
             q = self._queues.get(d)
             if not q or d in self._active:
@@ -494,7 +517,7 @@ class _MakeJobs:
 
         threading.Thread(target=work, daemon=True, name="fm-make").start()
 
-    def get(self, job: str):
+    def get(self, job: str) -> tuple[bool, RunResult | None] | None:
         """(done, result) for a job, or None if unknown or expired."""
         with self._lock:
             e = self._results.get(job)
@@ -512,14 +535,16 @@ class _ThumbCache:
     total bytes.
     """
 
-    def __init__(self, max_entries: int, max_bytes: int):
+    def __init__(self, max_entries: int, max_bytes: int) -> None:
         self._max_entries = max_entries
         self._max_bytes = max_bytes
-        self._entries = OrderedDict()  # key -> (etag, ctype, data)
+        self._entries: OrderedDict[ThumbKey, ThumbVal] = (
+            OrderedDict()
+        )  # key -> (etag, ctype, data)
         self._bytes = 0
         self._lock = threading.Lock()
 
-    def get(self, key):
+    def get(self, key: ThumbKey) -> ThumbVal | None:
         with self._lock:
             e = self._entries.get(key)
             if e is None:
@@ -527,7 +552,7 @@ class _ThumbCache:
             self._entries.move_to_end(key)
             return e
 
-    def put(self, key, etag, ctype, data):
+    def put(self, key: ThumbKey, etag: str, ctype: str, data: bytes) -> None:
         with self._lock:
             old = self._entries.pop(key, None)
             if old is not None:
@@ -597,7 +622,7 @@ def dir_size(p: Path) -> int:
     return total
 
 
-def extract_zip(zip_path: Path, dest_dir: Path) -> dict:
+def extract_zip(zip_path: Path, dest_dir: Path) -> dict[str, Any]:
     """Extract zip_path into dest_dir, refusing entries that would escape
     it (zip-slip) or overwrite the archive itself. Returns a summary."""
     dest_dir = dest_dir.resolve()
@@ -646,20 +671,20 @@ class _ChunkedZipSink:
     byte by byte — no temp file, no need to know the final size up front.
     """
 
-    def __init__(self, sink):
+    def __init__(self, sink: BinaryIO) -> None:
         self.sink = sink
         self._closed = False
 
-    def write(self, data):
+    def write(self, data: bytes) -> int:
         if not data:
             return 0
         self.sink.write(b"%X\r\n" % len(data) + data + b"\r\n")
         return len(data)
 
-    def flush(self):
+    def flush(self) -> None:
         self.sink.flush()
 
-    def close(self):
+    def close(self) -> None:
         if not self._closed:
             self.sink.write(b"0\r\n\r\n")
             self._closed = True
@@ -681,7 +706,7 @@ class Handler(BaseHTTPRequestHandler):
             ua = "-"
         return "".join(ch if ch.isprintable() else " " for ch in ua)[:200].strip()
 
-    def log_request(self, code="-", size="-"):
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         """Log the request line plus the client's User-Agent.
 
         The stock handler omits request headers, which makes anonymous
@@ -696,7 +721,9 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     # -- low-level helpers -------------------------------------------------
-    def _send(self, code, body, ctype, headers=None):
+    def _send(
+        self, code: int, body: bytes, ctype: str, headers: dict[str, str] | None = None
+    ) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -706,12 +733,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_json(self, obj, code=200):
+    def send_json(self, obj: Any, code: int = 200) -> None:
         self._send(
             code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8"
         )
 
-    def send_error_json(self, code, msg):
+    def send_error_json(self, code: int, msg: str) -> None:
         try:
             body = json.dumps({"error": msg}).encode("utf-8")
             self.close_connection = True
@@ -724,7 +751,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self.close_connection = True
 
-    def send_html(self):
+    def send_html(self) -> None:
         root_name = ROOT.name or str(ROOT)
         features = json.dumps(
             {"shell": ENABLE_SHELL, "run": ENABLE_RUN, "make": ENABLE_MAKE}
@@ -743,7 +770,7 @@ class Handler(BaseHTTPRequestHandler):
             {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
         )
 
-    def stream_file(self, p: Path, attachment: bool):
+    def stream_file(self, p: Path, attachment: bool) -> None:
         ctype, _ = mimetypes.guess_type(p.name)
         ctype = ctype or "application/octet-stream"
         mode = "attachment" if attachment else "inline"
@@ -768,7 +795,7 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0) or 0)
         return self.rfile.read(n) if n > 0 else b""
 
-    def _file(self, qs) -> Path:
+    def _file(self, qs: Qs) -> Path:
         p = safe_path(qs.get("path", [""])[0])
         if not p.is_file():
             raise HTTPError(404, "File not found")
@@ -782,7 +809,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         return (self.headers.get("X-FM-Auto-Make") or "").strip() == "0"
 
-    def maybe_run_make(self, dirp: Path):
+    def maybe_run_make(self, dirp: Path) -> dict[str, str] | None:
         """Queue a background make in dirp after a change, unless the client
         disabled it or the folder has no Makefile.
 
@@ -797,7 +824,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"job": MAKE_JOBS.submit(dirp)}
 
     # -- routing -----------------------------------------------------------
-    def do_GET(self):
+    def do_GET(self) -> None:
         try:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
@@ -830,7 +857,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             self.send_error_json(500, f"Server error: {e}")
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         try:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
@@ -869,7 +896,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(500, f"Server error: {e}")
 
     # -- endpoints ---------------------------------------------------------
-    def ep_list(self, qs):
+    def ep_list(self, qs: Qs) -> None:
         p = safe_path(qs.get("path", [""])[0])
         if not p.is_dir():
             raise HTTPError(404, "Directory not found")
@@ -909,7 +936,7 @@ class Handler(BaseHTTPRequestHandler):
             parent = "" if p.parent == ROOT else rel_of(p.parent)
         self.send_json({"path": rel_of(p), "parent": parent, "entries": entries})
 
-    def ep_mkdir(self, qs):
+    def ep_mkdir(self, qs: Qs) -> None:
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot modify the root directory")
@@ -920,7 +947,7 @@ class Handler(BaseHTTPRequestHandler):
         p.mkdir()
         self.send_json({"ok": True, "path": rel_of(p)})
 
-    def ep_newfile(self, qs):
+    def ep_newfile(self, qs: Qs) -> None:
         """Create an empty file (used by the 'New text file' menu item)."""
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
@@ -932,7 +959,7 @@ class Handler(BaseHTTPRequestHandler):
         p.write_bytes(b"")
         self.send_json({"ok": True, "path": rel_of(p)})
 
-    def ep_delete(self, qs):
+    def ep_delete(self, qs: Qs) -> None:
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot delete the root directory")
@@ -949,7 +976,7 @@ class Handler(BaseHTTPRequestHandler):
             resp["make"] = make_result
         self.send_json(resp)
 
-    def ep_rename(self, qs):
+    def ep_rename(self, qs: Qs) -> None:
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot rename the root directory")
@@ -970,7 +997,7 @@ class Handler(BaseHTTPRequestHandler):
         p.rename(dest)
         self.send_json({"ok": True, "path": rel_of(dest), "name": new_name})
 
-    def ep_move(self, qs):
+    def ep_move(self, qs: Qs) -> None:
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot move the root directory")
@@ -996,7 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
         shutil.move(str(p), str(dest))
         self.send_json({"ok": True, "path": rel_of(dest), "name": p.name})
 
-    def ep_tree(self, qs):
+    def ep_tree(self, qs: Qs) -> None:
         """Return a minimal folder tree for the move-to picker."""
         p = safe_path(qs.get("path", [""])[0])
         if not p.is_dir():
@@ -1010,7 +1037,7 @@ class Handler(BaseHTTPRequestHandler):
             parent = "" if p.parent == ROOT else rel_of(p.parent)
         self.send_json({"path": rel_of(p), "parent": parent, "dirs": dirs})
 
-    def ep_foldersize(self, qs):
+    def ep_foldersize(self, qs: Qs) -> None:
         """Compute recursive sizes for a list of directories in one request."""
         body = self._read_body()
         try:
@@ -1029,7 +1056,7 @@ class Handler(BaseHTTPRequestHandler):
                 sizes[rel_of(p)] = dir_size(p)
         self.send_json({"sizes": sizes})
 
-    def ep_text(self, qs):
+    def ep_text(self, qs: Qs) -> None:
         p = self._file(qs)
         size = p.stat().st_size
         if size > MAX_TEXT_SIZE:
@@ -1053,7 +1080,7 @@ class Handler(BaseHTTPRequestHandler):
             }
         )
 
-    def ep_save(self, qs):
+    def ep_save(self, qs: Qs) -> None:
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT or p.is_dir():
             raise HTTPError(400, "Target is not a file")
@@ -1088,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
             resp["make"] = make_result
         self.send_json(resp)
 
-    def ep_upload(self, qs):
+    def ep_upload(self, qs: Qs) -> None:
         dest_dir = safe_path(qs.get("path", [""])[0])
         if not dest_dir.is_dir():
             raise HTTPError(404, "Target folder not found")
@@ -1117,7 +1144,7 @@ class Handler(BaseHTTPRequestHandler):
             resp["make"] = make_result
         self.send_json(resp)
 
-    def ep_upload64(self, qs):
+    def ep_upload64(self, qs: Qs) -> None:
         """Receive a file as base64 in a JSON body (workaround for flaky
         binary uploads): {"data": "<base64>"}. A data-URL prefix is accepted."""
         dest_dir = safe_path(qs.get("path", [""])[0])
@@ -1161,7 +1188,7 @@ class Handler(BaseHTTPRequestHandler):
             resp["make"] = make_result
         self.send_json(resp)
 
-    def ep_download64(self, qs):
+    def ep_download64(self, qs: Qs) -> None:
         """Return a file base64-encoded in a JSON body (workaround for
         flaky binary downloads): the browser decodes it into a Blob.
 
@@ -1207,7 +1234,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
 
-    def ep_extract(self, qs):
+    def ep_extract(self, qs: Qs) -> None:
         """Extract a zip file into a folder (default: its own folder)."""
         p = safe_path(qs.get("path", [""])[0])
         if not p.is_file():
@@ -1234,7 +1261,7 @@ class Handler(BaseHTTPRequestHandler):
             result["deleted"] = True
         self.send_json({"ok": True, **result})
 
-    def ep_run(self, qs):
+    def ep_run(self, qs: Qs) -> None:
         """Execute an executable file, capturing output (with timeout)."""
         if not ENABLE_RUN:
             raise HTTPError(403, "Executing files is disabled (started with --no-run)")
@@ -1264,7 +1291,7 @@ class Handler(BaseHTTPRequestHandler):
         timeout = max(1, min(timeout, RUN_MAX_TIMEOUT))
         self.send_json(run_executable(p, args, timeout, MAX_RUN_OUTPUT))
 
-    def ep_make(self, qs):
+    def ep_make(self, qs: Qs) -> None:
         """Run make in a folder on demand (header "Make" button).
 
         Unlike the automatic runs, this ignores the client's auto-make
@@ -1288,7 +1315,7 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(400, "No Makefile in this folder")
         self.send_json(result)
 
-    def ep_make_result(self, qs):
+    def ep_make_result(self, qs: Qs) -> None:
         """Poll a background auto-make job started by save/upload/delete."""
         job = qs.get("job", [""])[0]
         got = MAKE_JOBS.get(job)
@@ -1300,7 +1327,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_json({"done": True, "result": result})
 
-    def ep_shell(self, qs):
+    def ep_shell(self, qs: Qs) -> None:
         """Run an arbitrary command through the configured shell (bash -c)."""
         if not ENABLE_SHELL:
             raise HTTPError(403, "Shell access is disabled (started with --no-shell)")
@@ -1336,7 +1363,7 @@ class Handler(BaseHTTPRequestHandler):
             }
         )
 
-    def ep_zip(self, qs):
+    def ep_zip(self, qs: Qs) -> None:
         """Zip a directory (recursively) and stream it as a download.
 
         The archive is written straight to the socket (chunked transfer
@@ -1378,7 +1405,7 @@ class Handler(BaseHTTPRequestHandler):
         if count == 0:
             self.log_message("zip of %r contained no files", rel_of(p) or "/")
 
-    def ep_thumbnail(self, rel: str):
+    def ep_thumbnail(self, rel: str) -> None:
         """Serve a Pillow thumbnail for an image, <= THUMB_SIZE.
 
         Rendered thumbnails are kept in a process-local LRU cache keyed by
@@ -2864,7 +2891,7 @@ updateSortIndicators();
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main(argv=None):
+def main(argv: list[str] | None = None) -> None:
     global ROOT, ENABLE_SHELL, ENABLE_RUN, ENABLE_MAKE
     ap = argparse.ArgumentParser(
         description="Single-file web file manager (stdlib + optional Pillow)."
