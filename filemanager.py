@@ -12,10 +12,12 @@ dependency-free HTML/JS/CSS interface. Folders show their recursive
 size; the listing shows created and last-updated times and can be sorted
 by name, size, or either timestamp; images get Pillow-generated
 thumbnails in the listing. If a Makefile is present in a directory,
-`make` is run there automatically after files are edited, uploaded or
-deleted; the "Auto-make" toggle in the header turns that off (the choice
-is kept in the browser's localStorage, so the server stays stateless).
-The "Make" button runs `make` in the current folder on demand.
+`make` is run there automatically in the background after files are
+edited, uploaded or deleted (a popup shows the result once the build
+finishes); the "Auto-make" toggle in the header turns that off (the
+choice is kept in the browser's localStorage, so the server stays
+stateless). The "Make" button runs `make` in the current folder on
+demand and waits for the result.
 
 Everything is stateless: it serves the directory the app was started in
 (or a path passed as the first argument) and stores no config, database,
@@ -37,17 +39,22 @@ import io
 import json
 import mimetypes
 import os
+import selectors
 import shlex
 import signal
 import shutil
+import stat
 import subprocess
-import tempfile
 import sys
-from contextlib import contextmanager
+import threading
+import time
+import uuid
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import zipfile
+import zlib
 
 # ---------------------------------------------------------------------------
 # Limits / tuning (edit to taste)
@@ -56,6 +63,11 @@ THUMB_SIZE = (120, 120)  # max thumbnail dimension (px)
 MAX_RUN_OUTPUT = 1024 * 1024  # 1 MB cap on captured output per run
 RUN_TIMEOUT = 60  # default run timeout (seconds)
 RUN_MAX_TIMEOUT = 3600  # hard cap on run timeout (seconds)
+MAX_TEXT_SIZE = 20 * 1024 * 1024  # /api/text refuses to load files above this
+MAX_B64_FILE_SIZE = 128 * 1024 * 1024  # /api/download64 file-size limit
+MAX_B64_BODY_SIZE = 128 * 1024 * 1024  # /api/upload64 request-body limit
+THUMB_CACHE_MAX_ENTRIES = 512  # rendered thumbnails kept in memory
+THUMB_CACHE_MAX_BYTES = 64 * 1024 * 1024
 SHELL_CMD = "bash"  # shell used for the Shell button
 MAKE_CMD = "make"  # run automatically after edits/uploads when a Makefile is present
 # On Windows, X_OK is True for nearly every file, so gate the Run button on
@@ -272,10 +284,21 @@ def created_time(st) -> float:
     return birth if birth else st.st_ctime
 
 
-def is_executable(p: Path) -> bool:
-    """True if p is a regular file the current user can execute."""
+def is_executable(p: Path, st=None) -> bool:
+    """True if p is a regular file the current user can execute.
+
+    Pass the stat result when one is already at hand (e.g. from a
+    directory scan) to avoid an extra syscall.
+    """
+    if st is None:
+        try:
+            st = p.stat()
+        except OSError:
+            return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
     try:
-        if not p.is_file() or not os.access(p, os.X_OK):
+        if not os.access(p, os.X_OK):
             return False
     except OSError:
         return False
@@ -285,8 +308,17 @@ def is_executable(p: Path) -> bool:
 
 
 def _run_captured(argv, cwd, timeout, max_out):
-    """Run argv in cwd, capture combined stdout+stderr with a group kill on
-    timeout. Returns (code, timed_out, truncated, text, cwd_rel)."""
+    """Run argv in cwd, capture combined stdout+stderr, and kill the whole
+    process group on timeout.
+
+    Output is drained with a hard cap of max_out bytes: once the cap is
+    reached, further output is read and discarded instead of being kept,
+    so a chatty child (e.g. `yes`) can never exhaust server memory no
+    matter how long it runs. The child is still allowed to run to
+    completion after the cap, so its real exit code is reported.
+
+    Returns (code, timed_out, truncated, text, cwd_rel).
+    """
     cwd_str = str(cwd) if (cwd and cwd.is_dir()) else None
     try:
         proc = subprocess.Popen(
@@ -300,11 +332,32 @@ def _run_captured(argv, cwd, timeout, max_out):
     except OSError as e:
         raise HTTPError(400, f"Could not start process: {e}")
 
+    deadline = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    head = bytearray()
+    truncated = False
     timed_out = False
     try:
-        out, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not sel.select(timeout=remaining):
+                timed_out = True
+                break
+            room = max_out - len(head)
+            chunk = os.read(proc.stdout.fileno(), room if room > 0 else 65536)
+            if not chunk:  # EOF
+                break
+            if room > 0:
+                head += chunk[:room]
+            if len(chunk) > room:
+                truncated = True
+    except OSError:  # the child died mid-read; treat as EOF
+        pass
+    finally:
+        sel.close()
+
+    if timed_out:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except Exception:  # noqa: BLE001
@@ -312,15 +365,17 @@ def _run_captured(argv, cwd, timeout, max_out):
                 proc.kill()
             except Exception:
                 pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
         try:
-            out, _ = proc.communicate(timeout=5)
-        except Exception:  # noqa: BLE001
             proc.kill()
-            out = b""
+        except Exception:  # noqa: BLE001
+            pass
+        proc.wait()
 
     code = None if timed_out else proc.returncode
-    truncated = len(out) > max_out
-    text = out[:max_out].decode("utf-8", "replace")
+    text = bytes(head).decode("utf-8", "replace")
     cwd_rel = rel_of(Path(cwd_str)) if cwd_str else (rel_of(ROOT) or "/")
     return code, timed_out, truncated, text, cwd_rel
 
@@ -360,6 +415,126 @@ def run_make_if_present(dirp: Path):
     }
 
 
+class _MakeJobs:
+    """Background auto-make runner with per-directory serialization.
+
+    Save/upload/delete handlers call submit() to queue a build; the build
+    runs in a daemon thread so the HTTP response returns immediately. The
+    client polls the job id until it reports done. At most one make runs
+    per directory at a time, and jobs submitted while a build is running
+    are coalesced: they wait and share the result of the next build, so
+    a burst of uploads triggers one rebuild per burst instead of one
+    blocking make per file.
+    """
+
+    def __init__(self, ttl: float):
+        self._lock = threading.Lock()
+        self._results = OrderedDict()  # job id -> [created, done, result]
+        self._queues = {}  # directory (str) -> [job ids] awaiting a build
+        self._active = set()  # directories with a build running
+        self._ttl = ttl
+
+    def _sweep(self):
+        now = time.monotonic()
+        for k in [k for k, (t, _d, _r) in self._results.items() if now - t > self._ttl]:
+            del self._results[k]
+
+    def submit(self, dirp: Path) -> str:
+        """Queue a build of dirp and return the job id to poll for."""
+        d = str(dirp)
+        job = uuid.uuid4().hex
+        with self._lock:
+            self._sweep()
+            self._results[job] = [time.monotonic(), False, None]
+            self._queues.setdefault(d, []).append(job)
+            start = d not in self._active
+        if start:
+            self._build(d)
+        return job
+
+    def _build(self, d: str):
+        with self._lock:
+            q = self._queues.get(d)
+            if not q or d in self._active:
+                return
+            self._active.add(d)
+            batch = q[:]
+            q.clear()
+
+        def work():
+            try:
+                result = run_make_if_present(Path(d))
+            except HTTPError as e:
+                result = {
+                    "code": None,
+                    "timed_out": False,
+                    "truncated": False,
+                    "output": str(e),
+                    "cwd": "",
+                }
+            with self._lock:
+                for j in batch:
+                    e = self._results.get(j)
+                    if e is not None:
+                        e[1] = True
+                        e[2] = result
+                self._active.discard(d)
+                again = bool(self._queues.get(d))
+            if again:
+                self._build(d)
+
+        threading.Thread(target=work, daemon=True, name="fm-make").start()
+
+    def get(self, job: str):
+        """(done, result) for a job, or None if unknown or expired."""
+        with self._lock:
+            e = self._results.get(job)
+            return (e[1], e[2]) if e else None
+
+
+MAKE_JOBS = _MakeJobs(ttl=RUN_MAX_TIMEOUT)
+
+
+class _ThumbCache:
+    """Thread-safe LRU cache of rendered thumbnails.
+
+    Keyed by (path, mtime_ns, size), so an edited or replaced image
+    invalidates its own entry automatically. Bounded in entry count and
+    total bytes.
+    """
+
+    def __init__(self, max_entries: int, max_bytes: int):
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._entries = OrderedDict()  # key -> (etag, ctype, data)
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            e = self._entries.get(key)
+            if e is None:
+                return None
+            self._entries.move_to_end(key)
+            return e
+
+    def put(self, key, etag, ctype, data):
+        with self._lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._bytes -= len(old[2])
+            self._entries[key] = (etag, ctype, data)
+            self._bytes += len(data)
+            while (
+                len(self._entries) > self._max_entries or self._bytes > self._max_bytes
+            ):
+                _k, evicted = self._entries.popitem(last=False)
+                self._bytes -= len(evicted[2])
+
+
+THUMB_CACHE = _ThumbCache(THUMB_CACHE_MAX_ENTRIES, THUMB_CACHE_MAX_BYTES)
+
+
 def unique_dest(dirp: Path, name: str) -> Path:
     """Avoid silently overwriting on upload: append ' (1)', ' (2)', ..."""
     dest = dirp / name
@@ -388,17 +563,28 @@ def validate_new_name(name: str) -> None:
 def dir_size(p: Path) -> int:
     """Recursively sum the size of all regular files under p (bytes).
 
-    Symlinked directories are not followed. Unreadable entries are skipped.
+    Symlinks (to files or directories) are not counted or followed.
+    Unreadable entries are skipped. One stat per directory entry.
     """
     total = 0
-    for dirpath, _dirnames, filenames in os.walk(p, onerror=lambda e: None):
-        for fn in filenames:
-            fp = os.path.join(dirpath, fn)
-            try:
-                if not os.path.islink(fp) and os.path.isfile(fp):
-                    total += os.path.getsize(fp)
-            except OSError:
-                pass
+    stack = [p]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for de in it:
+                try:
+                    st = de.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                mode = st.st_mode
+                if stat.S_ISDIR(mode):
+                    stack.append(de.path)
+                elif stat.S_ISREG(mode):
+                    total += st.st_size
     return total
 
 
@@ -443,41 +629,31 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> dict:
     return {"entries": entries, "bytes": total}
 
 
-def zip_dir_stream(dirp: Path):
-    """Write a zip of dirp's contents (recursive) to a temp file.
+class _ChunkedZipSink:
+    """Zip-file destination that streams over HTTP chunked transfer.
 
-    Symlinked directories are not followed; unreadable entries are skipped.
-    Returns a context manager yielding (temp_path, entry_count) and deleting
-    the temp file when done.
+    zipfile treats a file object without tell()/seek() as non-seekable
+    and writes data descriptors, so the archive can be produced and sent
+    byte by byte — no temp file, no need to know the final size up front.
     """
-    fd, name = tempfile.mkstemp(prefix="fm-zip-", suffix=".zip")
-    os.close(fd)
-    tmp = Path(name)
-    count = 0
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-        for dirpath, dirnames, filenames in os.walk(
-            dirp, onerror=lambda e: None, followlinks=False
-        ):
-            base = Path(dirpath)
-            dirnames[:] = [d for d in dirnames if not (base / d).is_symlink()]
-            for fn in sorted(filenames):
-                fp = base / fn
-                try:
-                    if fp.is_symlink() or not fp.is_file():
-                        continue
-                    zf.write(fp, fp.relative_to(dirp).as_posix())
-                    count += 1
-                except OSError:
-                    pass
 
-    @contextmanager
-    def _mgr():
-        try:
-            yield tmp, count
-        finally:
-            tmp.unlink(missing_ok=True)
+    def __init__(self, sink):
+        self.sink = sink
+        self._closed = False
 
-    return _mgr()
+    def write(self, data):
+        if not data:
+            return 0
+        self.sink.write(b"%X\r\n" % len(data) + data + b"\r\n")
+        return len(data)
+
+    def flush(self):
+        self.sink.flush()
+
+    def close(self):
+        if not self._closed:
+            self.sink.write(b"0\r\n\r\n")
+            self._closed = True
 
 
 # ---------------------------------------------------------------------------
@@ -591,10 +767,18 @@ class Handler(BaseHTTPRequestHandler):
         return (self.headers.get("X-FM-Auto-Make") or "").strip() == "0"
 
     def maybe_run_make(self, dirp: Path):
-        """Run make in dirp after a change, unless the client disabled it."""
+        """Queue a background make in dirp after a change, unless the client
+        disabled it or the folder has no Makefile.
+
+        The build no longer blocks this response: it returns {"job": id},
+        which the client polls via /api/make/result until the build
+        finishes. Returns None when nothing needs to be built.
+        """
         if self.auto_make_disabled():
             return None
-        return run_make_if_present(dirp)
+        if not (dirp / "Makefile").is_file():
+            return None
+        return {"job": MAKE_JOBS.submit(dirp)}
 
     # -- routing -----------------------------------------------------------
     def do_GET(self):
@@ -618,6 +802,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.ep_tree(qs)
             elif path == "/api/zip":
                 self.ep_zip(qs)
+            elif path == "/api/make/result":
+                self.ep_make_result(qs)
             elif path.startswith("/api/thumbnail/"):
                 rel = unquote(path[len("/api/thumbnail/") :])
                 self.ep_thumbnail(rel)
@@ -671,25 +857,36 @@ class Handler(BaseHTTPRequestHandler):
         p = safe_path(qs.get("path", [""])[0])
         if not p.is_dir():
             raise HTTPError(404, "Directory not found")
+        prefix = rel_of(p)
         entries = []
-        for item in p.iterdir():
-            try:
-                st = item.stat()
-                is_dir = item.is_dir()
-            except OSError:
-                continue
-            entries.append(
-                {
-                    "name": item.name,
-                    "path": rel_of(item),
-                    "kind": "dir" if is_dir else classify(item.name),
-                    "size": None if is_dir else st.st_size,
-                    "ctime": created_time(st),
-                    "mtime": st.st_mtime,
-                    "thumb": (not is_dir) and item.suffix.lower() in THUMB_EXTS,
-                    "run": (not is_dir) and is_executable(item),
-                }
-            )
+        try:
+            it = os.scandir(p)
+        except OSError:
+            raise HTTPError(404, "Directory not found")
+        with it:
+            for de in it:
+                try:
+                    st = de.stat()  # follow symlinks (as before)
+                except OSError:
+                    try:  # broken symlink: still show it
+                        st = de.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                is_dir = stat.S_ISDIR(st.st_mode)
+                is_reg = stat.S_ISREG(st.st_mode)
+                ext = os.path.splitext(de.name)[1].lower()
+                entries.append(
+                    {
+                        "name": de.name,
+                        "path": (prefix + "/" + de.name) if prefix else de.name,
+                        "kind": "dir" if is_dir else classify(de.name),
+                        "size": st.st_size if is_reg else None,
+                        "ctime": created_time(st),
+                        "mtime": st.st_mtime,
+                        "thumb": is_reg and ext in THUMB_EXTS,
+                        "run": is_reg and is_executable(de.path, st),
+                    }
+                )
         entries.sort(key=lambda e: (e["kind"] != "dir", e["name"].lower()))
         parent = None
         if p != ROOT:
@@ -818,8 +1015,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def ep_text(self, qs):
         p = self._file(qs)
+        size = p.stat().st_size
+        if size > MAX_TEXT_SIZE:
+            raise HTTPError(
+                413,
+                f"File is too large to edit in the browser "
+                f"(limit {MAX_TEXT_SIZE // (1024 * 1024)} MB) — download it instead",
+            )
         raw = p.read_bytes()
-        size = len(raw)
         try:
             content = raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -907,6 +1110,14 @@ class Handler(BaseHTTPRequestHandler):
         name = os.path.basename(qs.get("filename", [""])[0] or "")
         if not name or name in (".", ".."):
             raise HTTPError(400, "Invalid filename")
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > MAX_B64_BODY_SIZE:
+            raise HTTPError(
+                413,
+                f"Upload is too large for base64 transfer "
+                f"(limit {MAX_B64_BODY_SIZE // (1024 * 1024)} MB body) — "
+                f"use the regular upload instead",
+            )
         body = self._read_body()
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -936,11 +1147,49 @@ class Handler(BaseHTTPRequestHandler):
 
     def ep_download64(self, qs):
         """Return a file base64-encoded in a JSON body (workaround for
-        flaky binary downloads): the browser decodes it into a Blob."""
+        flaky binary downloads): the browser decodes it into a Blob.
+
+        The base64 payload is streamed in 3 MB chunks, so memory stays
+        flat no matter how large the file is (the cap below still applies,
+        because the browser holds the whole result in RAM as a Blob).
+        """
         p = self._file(qs)
         size = p.stat().st_size
-        data = base64.b64encode(p.read_bytes()).decode("ascii")
-        self.send_json({"path": rel_of(p), "name": p.name, "size": size, "data": data})
+        if size > MAX_B64_FILE_SIZE:
+            raise HTTPError(
+                413,
+                f"File is too large for base64 transfer "
+                f"(limit {MAX_B64_FILE_SIZE // (1024 * 1024)} MB) — use the "
+                f"regular Download instead",
+            )
+        head = (
+            '{"path":'
+            + json.dumps(rel_of(p))
+            + ',"name":'
+            + json.dumps(p.name)
+            + f',"size":{size},"data":"'
+        )
+        tail = '"}'
+        b64_len = 4 * ((size + 2) // 3)  # exact encoded length, padding included
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(head) + b64_len + len(tail)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(head.encode("utf-8"))
+            # Encode exact multiples of 3 bytes so chunk boundaries never
+            # interact with base64 padding; only the last chunk gets it.
+            step = 1024 * 1024 * 3
+            with p.open("rb") as f:
+                while True:
+                    chunk = f.read(step)
+                    if not chunk:
+                        break
+                    self.wfile.write(base64.b64encode(chunk))
+            self.wfile.write(tail.encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def ep_extract(self, qs):
         """Extract a zip file into a folder (default: its own folder)."""
@@ -1019,6 +1268,18 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(400, "No Makefile in this folder")
         self.send_json(result)
 
+    def ep_make_result(self, qs):
+        """Poll a background auto-make job started by save/upload/delete."""
+        job = qs.get("job", [""])[0]
+        got = MAKE_JOBS.get(job)
+        if got is None:
+            raise HTTPError(404, "Unknown or expired make job")
+        done, result = got
+        if not done:
+            self.send_json({"done": False})
+        else:
+            self.send_json({"done": True, "result": result})
+
     def ep_shell(self, qs):
         """Run an arbitrary command through the configured shell (bash -c)."""
         body = self._read_body()
@@ -1056,74 +1317,109 @@ class Handler(BaseHTTPRequestHandler):
     def ep_zip(self, qs):
         """Zip a directory (recursively) and stream it as a download.
 
-        The archive is built in a temp file outside the served root, so it
-        never shows up in the listing while it is being created.
+        The archive is written straight to the socket (chunked transfer
+        encoding): no temp file, and the first bytes reach the client as
+        soon as the first file is compressed.
         """
         p = safe_path(qs.get("path", [""])[0])
         if not p.is_dir():
             raise HTTPError(404, "Directory not found")
-        with zip_dir_stream(p) as (tmp, count):
-            fname = quote(f"{p.name or 'root'}.zip")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Length", str(tmp.stat().st_size))
-            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            try:
-                with tmp.open("rb") as f:
-                    while True:
-                        chunk = f.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                self.close_connection = True
+        fname = quote(f"{p.name or 'root'}.zip")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        count = 0
+        sink = _ChunkedZipSink(self.wfile)
+        try:
+            with zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED) as zf:
+                for dirpath, dirnames, filenames in os.walk(
+                    p, onerror=lambda e: None, followlinks=False
+                ):
+                    base = Path(dirpath)
+                    dirnames[:] = [d for d in dirnames if not (base / d).is_symlink()]
+                    for fn in sorted(filenames):
+                        fp = base / fn
+                        try:
+                            if fp.is_symlink() or not fp.is_file():
+                                continue
+                            zf.write(fp, fp.relative_to(p).as_posix())
+                            count += 1
+                        except OSError:
+                            pass
+            sink.close()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+            return
         if count == 0:
             self.log_message("zip of %r contained no files", rel_of(p) or "/")
 
     def ep_thumbnail(self, rel: str):
-        """Generate and serve a Pillow thumbnail for an image, <= THUMB_SIZE."""
+        """Serve a Pillow thumbnail for an image, <= THUMB_SIZE.
+
+        Rendered thumbnails are kept in a process-local LRU cache keyed by
+        (path, mtime, size), so re-browsing a folder is a dict lookup
+        instead of a full-resolution decode. Responses carry an ETag;
+        clients that revalidate (Cache-Control: no-cache) get a cheap 304.
+        """
         p = safe_path(rel)
-        if not p.is_file():
+        try:
+            st = p.stat()
+        except OSError:
+            raise HTTPError(404, "File not found")
+        if not stat.S_ISREG(st.st_mode):
             raise HTTPError(404, "File not found")
         if p.suffix.lower() not in THUMB_EXTS:
             raise HTTPError(400, "Not a thumbnailable image")
-        try:
-            from PIL import Image
-        except ImportError:
-            raise HTTPError(501, "Pillow is not installed; thumbnails unavailable")
-        try:
-            with Image.open(p) as im:
-                im.load()
-                # Orientation correction for EXIF-rotated photos (JPG/etc.)
-                try:
-                    from PIL import ImageOps
+        key = (p, st.st_mtime_ns, st.st_size)
+        cached = THUMB_CACHE.get(key)
+        if cached is None:
+            try:
+                from PIL import Image
+            except ImportError:
+                raise HTTPError(501, "Pillow is not installed; thumbnails unavailable")
+            try:
+                with Image.open(p) as im:
+                    im.load()
+                    # Orientation correction for EXIF-rotated photos (JPG/etc.)
+                    try:
+                        from PIL import ImageOps
 
-                    im = ImageOps.exif_transpose(im)
-                except Exception:  # noqa: BLE001
-                    pass
-                im.thumbnail(THUMB_SIZE)
-                want_alpha = (
-                    "A" in im.mode
-                    or im.mode == "P"
-                    or p.suffix.lower() in (".png", ".gif", ".webp", ".ico")
-                )
-                buf = io.BytesIO()
-                if want_alpha:
-                    if im.mode not in ("RGBA", "LA", "P"):
-                        im = im.convert("RGBA")
-                    im.save(buf, "PNG")
-                    fmt = "PNG"
-                else:
-                    if im.mode not in ("RGB", "L"):
-                        im = im.convert("RGB")
-                    im.save(buf, "JPEG", quality=82)
-                    fmt = "JPEG"
-                data = buf.getvalue()
-        except Exception:  # noqa: BLE001
-            raise HTTPError(400, "Could not decode image")
-        self._send(200, data, f"image/{fmt.lower()}", {"Cache-Control": "no-store"})
+                        im = ImageOps.exif_transpose(im)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    im.thumbnail(THUMB_SIZE)
+                    want_alpha = (
+                        "A" in im.mode
+                        or im.mode == "P"
+                        or p.suffix.lower() in (".png", ".gif", ".webp", ".ico")
+                    )
+                    buf = io.BytesIO()
+                    if want_alpha:
+                        if im.mode not in ("RGBA", "LA", "P"):
+                            im = im.convert("RGBA")
+                        im.save(buf, "PNG")
+                        fmt = "PNG"
+                    else:
+                        if im.mode not in ("RGB", "L"):
+                            im = im.convert("RGB")
+                        im.save(buf, "JPEG", quality=82)
+                        fmt = "JPEG"
+                    data = buf.getvalue()
+            except Exception:  # noqa: BLE001
+                raise HTTPError(400, "Could not decode image")
+            etag = '"%08x"' % (zlib.crc32(data) & 0xFFFFFFFF)
+            cached = (etag, f"image/{fmt.lower()}", data)
+            THUMB_CACHE.put(key, etag, cached[1], data)
+        etag, ctype, data = cached
+        if (self.headers.get("If-None-Match") or "").strip() == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        self._send(200, data, ctype, {"Cache-Control": "no-cache", "ETag": etag})
 
 
 # ---------------------------------------------------------------------------
@@ -1923,7 +2219,7 @@ function saveText(e, ta, sel, origNL){
     .then(d=>{
       toast("Saved "+e.name);
       closeModal(); load(state.path);
-      if(d.make) makeModal("after saving "+e.name, [{file:e.name, res:d.make}]);
+      if(d.make) pollMakeJobs("after saving "+e.name, [{file:e.name, job:d.make.job}]);
     })
     .catch(err=>toast(err.message, true));
 }
@@ -1936,7 +2232,7 @@ function del(e){
     .then(d=>{
       toast("Deleted "+e.name);
       load(state.path);
-      if(d.make) makeModal("after deleting "+e.name, [{file:e.name, res:d.make}]);
+      if(d.make) pollMakeJobs("after deleting "+e.name, [{file:e.name, job:d.make.job}]);
     })
     .catch(err=>toast(err.message, true));
 }
@@ -2040,6 +2336,26 @@ function makeModal(title, runs){
         '<pre class="runout">'+esc(d.output||"(no output)")+'</pre>';
     }).join("")+
     '<div class="modal-actions"><button class="btn btn-primary" onclick="closeModal()">Close</button></div>');
+}
+
+// Auto-make runs in the server's background: poll each job until it reports
+// a result, then show one combined make modal (as before).
+function pollMakeJobs(title, jobs){
+  const t0=Date.now();
+  const result={};
+  (function poll(){
+    const pending=jobs.filter(j=>result[j.job]===undefined);
+    if(!pending.length){
+      const runs=jobs.map(j=>({file:j.file, res:result[j.job]})).filter(r=>r.res);
+      if(runs.length) makeModal(title, runs);
+      return;
+    }
+    if(Date.now()-t0>10*60*1000){ toast("Make results expired", true); return; }
+    Promise.all(pending.map(j=>api("api/make/result?job="+j.job)
+        .then(d=>{ if(d.done) result[j.job]=d.result; })
+        .catch(err=>{ if(String(err.message).startsWith("404")) result[j.job]=null; })))
+      .then(()=>setTimeout(poll, 400));
+  })();
 }
 
 // -- Run executable file ----------------------------------------------------
@@ -2307,7 +2623,7 @@ function uploadAll(files, i, results, makeRuns){
   if(i>=files.length){
     toast("Upload complete");
     closeModal(); load(state.path);
-    if(makeRuns.length) makeModal("after upload", makeRuns);
+    if(makeRuns.length) pollMakeJobs("after upload", makeRuns);
     offerExtract(results.filter(r=>r.name.toLowerCase().endsWith(".zip")));
     return;
   }
@@ -2317,7 +2633,7 @@ function uploadAll(files, i, results, makeRuns){
     '<div class="bar"><div class="bar-fill" id="barFill"></div></div>'+
     '<div class="up-count">'+(i+1)+' / '+files.length+'</div>');
   uploadOne(f, p=>{ const b=$("#barFill"); if(b) b.style.width=(p*100).toFixed(1)+"%"; })
-    .then(r=>{ results.push(r); if(r.make) makeRuns.push({file:r.name, res:r.make}); uploadAll(files, i+1, results, makeRuns); })
+    .then(r=>{ results.push(r); if(r.make) makeRuns.push({file:r.name, job:r.make.job}); uploadAll(files, i+1, results, makeRuns); })
     .catch(err=>{ toast(f.name+": "+err.message, true); setTimeout(()=>uploadAll(files, i+1, results, makeRuns), 500); });
 }
 // -- Upload as base64 (workaround: encode in the browser, JSON over the wire)
@@ -2338,7 +2654,7 @@ function uploadB64All(files, i, makeRuns){
   if(i>=files.length){
     toast("Upload complete");
     closeModal(); load(state.path);
-    if(makeRuns.length) makeModal("after upload (base64)", makeRuns);
+    if(makeRuns.length) pollMakeJobs("after upload (base64)", makeRuns);
     return;
   }
   const f=files[i];
@@ -2350,7 +2666,7 @@ function uploadB64All(files, i, makeRuns){
   readB64(f)
     .then(b64=>api("api/upload64?path="+encodeURIComponent(state.path)+"&filename="+encodeURIComponent(f.name),
         { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ data: b64 }) }))
-    .then(r=>{ if(r.make) makeRuns.push({file:r.name, res:r.make}); uploadB64All(files, i+1, makeRuns); })
+    .then(r=>{ if(r.make) makeRuns.push({file:r.name, job:r.make.job}); uploadB64All(files, i+1, makeRuns); })
     .catch(err=>{ toast(f.name+": "+err.message, true); setTimeout(()=>uploadB64All(files, i+1, makeRuns), 500); });
 }
 
@@ -2543,6 +2859,7 @@ def main(argv=None):
         server = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as e:
         ap.error(f"could not bind {args.host}:{args.port} ({e})")
+    server.daemon_threads = True  # don't block shutdown on stuck request threads
 
     print(f"Serving: {ROOT}")
     print(f"URL:     http://{args.host}:{args.port}/")
