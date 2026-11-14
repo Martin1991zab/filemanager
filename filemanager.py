@@ -8,38 +8,59 @@ directories can be downloaded as zip, and files can be transferred as
 base64 — a JSON workaround for flaky networks),
 view & edit images and plain-text files, run
 executable files, and run arbitrary bash commands, all from a
-dependency-free HTML/JS/CSS interface. Folders show their recursive
+dependency-free HTML/JS/CSS interface with a Help popup that documents the
+whole thing in the browser. The same folder is also served as a WebDAV
+share (see --dav-path below), so it can be mounted with davfs2 and edited
+with ordinary Linux tools. Folders show their recursive
 size; the listing shows created and last-updated times and can be sorted
 by name, size, or either timestamp; images get Pillow-generated
-thumbnails in the listing. If a Makefile is present in a directory,
+thumbnails in the listing. The header holds only what is used every day
+(+ New, Upload); the less frequent actions — zip download of the current
+folder, base64 upload, make and the shell — are grouped in a Tools menu.
+If a Makefile is present in a directory,
 `make` is run there automatically in the background after files are
 edited, uploaded or deleted (a popup shows the result once the build
-finishes); the "Auto-make" toggle in the header turns that off (the
-choice is kept in the browser's localStorage, so the server stays
-stateless). The "Make" button runs `make` in the current folder on
-demand and waits for the result. Shell access, executable execution, make
-(both the automatic rebuilds and the manual Make button) and the base64
+finishes); the "Auto-make after edits" item in that menu turns that off
+(the choice is kept in the browser's localStorage, so the server stays
+stateless) and the "Run make here" item runs `make` in the current folder
+on demand and waits for the result. Shell access, executable execution, make
+(both the automatic rebuilds and the manual Make action) and the base64
 upload/download workaround can each be disabled entirely at startup with
 the --no-shell, --no-run, --no-make and --no-b64 flags.
 
 Everything is stateless: it serves the directory the app was started in
 (or a path passed as the first argument) and stores no config, database,
 or metadata. Authentication is expected to be handled by an external
-reverse proxy (there is none here).
+reverse proxy (there is none here). The only state kept is in memory and
+only to save work: rendered thumbnails, folder sizes, unfinished make jobs
+and, for WebDAV, the write-lock table — all TTL-bounded, all gone on
+restart, nothing to migrate.
 
 Symlinks inside the served tree are listed and browsed; the entry the
 listing shows is the one operations act on, so deleting a symlink to a
 folder removes the link and leaves the linked folder alone. A symlink may
 point outside the served directory (the parent path is still confined).
 
+WebDAV (RFC 4918) is served under a URL prefix (--dav-path, /dav by
+default) so clients can mount the same folder the browser shows. The
+target client is davfs2 on Linux: OPTIONS, PROPFIND, PROPPATCH, MKCOL,
+PUT, DELETE, MOVE, COPY, LOCK, UNLOCK, GET and HEAD are implemented, with
+exclusive write locks (compliance class 2) so a file open in the mount
+cannot be silently overwritten from the browser, and strong ETags plus
+If-Match/If-None-Match so a davfs2 upload that would clobber a newer file
+is refused instead. Microsoft extensions, Depth: infinite, shared locks
+and partial (Content-Range) uploads are deliberately not implemented.
+
 Run:
     python filemanager.py [directory] [--host HOST] [--port PORT]
                             [--read-only] [--no-shell] [--no-run]
-                            [--no-make] [--no-b64] [--shell-cmd CMD]
+                            [--no-make] [--no-b64] [--no-dav]
+                            [--dav-path PREFIX] [--shell-cmd CMD]
                             [--make-cmd CMD] [--version]
 
 GET /health answers a small JSON status document (used by the Docker
-health check); everything else lives under /api/* and speaks JSON.
+health check); everything else under /api/* speaks JSON, everything else
+under the WebDAV prefix speaks WebDAV.
 
 Uses only the Python standard library (3.10 or newer), plus (optionally)
 Pillow for image thumbnails. If Pillow is missing, the app still works:
@@ -57,6 +78,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import selectors
 import shlex
 import shutil
@@ -67,10 +89,13 @@ import sys
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 from collections import OrderedDict
 from collections.abc import Iterator
+from datetime import datetime, timezone
+from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO, TypedDict
@@ -86,11 +111,22 @@ MAX_RUN_OUTPUT = 1024 * 1024  # 1 MB cap on captured output per run
 RUN_TIMEOUT = 60  # default run timeout (seconds)
 RUN_MAX_TIMEOUT = 3600  # hard cap on run timeout (seconds)
 MAX_TEXT_SIZE = 20 * 1024 * 1024  # /api/text refuses to load files above this
-MAX_B64_FILE_SIZE = 128 * 1024 * 1024  # /api/download64 file-size limit
-MAX_B64_BODY_SIZE = 128 * 1024 * 1024  # /api/upload64 request-body limit
+# Every transfer path has to handle files up to this size: /api/upload and
+# /api/download, the zip download, WebDAV PUT/GET and the base64 workaround.
+# The first three are streamed, so they need no cap of their own (a full disk
+# already answers 413); only base64 needs one, because that workaround holds
+# the payload in memory at both ends.
+MAX_TRANSFER_SIZE = 1024 * 1024 * 1024  # what every transfer path must carry
+MAX_B64_FILE_SIZE = MAX_TRANSFER_SIZE  # /api/download64 file-size limit
+# base64 is four bytes for every three, so a base64 upload's JSON body is a
+# third larger than the file in it. Body and file used to share one number,
+# which quietly capped base64 uploads at three quarters of a download.
+MAX_B64_BODY_SIZE = (MAX_B64_FILE_SIZE + 2) // 3 * 4 + 64 * 1024
 MAX_JSON_BODY_SIZE = 64 * 1024 * 1024  # cap on any JSON request body
-MAX_ZIP_ENTRY_SIZE = 2 * 1024 * 1024 * 1024  # /api/extract per-entry size limit
-MAX_ZIP_TOTAL_SIZE = 4 * 1024 * 1024 * 1024  # /api/extract total output limit
+# A 1 GB archive of compressible material expands past itself by more than
+# fourfold all the time, so the extract limits sit above the transfer target.
+MAX_ZIP_ENTRY_SIZE = 4 * 1024 * 1024 * 1024  # /api/extract per-entry size limit
+MAX_ZIP_TOTAL_SIZE = 8 * 1024 * 1024 * 1024  # /api/extract total output limit
 READ_TIMEOUT = 30  # idle socket timeout: headers, body and stalled writes
 LIST_MAX_ENTRIES = 20_000  # /api/list caps the entries it returns
 DIR_SIZE_CACHE_TTL = 30  # seconds a computed folder size may be reused
@@ -100,7 +136,12 @@ THUMB_CACHE_MAX_BYTES = 64 * 1024 * 1024
 SVG_THUMB_LIMIT = 2 * 1024 * 1024  # SVGs are served to <img> as-is, up to this
 MAKE_MAX_CONCURRENT = 4  # builds running at once, across all folders
 MAKE_JOB_POLL_MS = 400  # how often the browser polls a make job
-SHELL_CMD = "bash"  # shell used for the Shell button (override: --shell-cmd)
+DAV_MAX_ENTRIES = 5_000  # entries one PROPFIND reports (davfs2 read_timeout is 30 s)
+DAV_LOCK_TTL = 1800  # seconds a WebDAV lock survives without refreshing
+DAV_LOCK_MAX_TIMEOUT = 86_400  # hard cap on a client-requested lock timeout
+DAV_MAX_XML_BODY = 1024 * 1024  # PROPFIND/PROPPATCH/LOCK request-body limit
+DAV_MAX_LOCKS = 4096  # locks kept in memory before the oldest go
+SHELL_CMD = "bash"  # shell used for the Shell action (override: --shell-cmd)
 MAKE_CMD = "make"  # run automatically after edits/uploads when a Makefile is present
 # On Windows, X_OK is True for nearly every file, so gate the Run button on
 # a known executable/script extension there. On POSIX the exec bit is enough.
@@ -246,11 +287,15 @@ TEXT_MIME_TYPES = {
 ROOT: Path = Path.cwd().resolve()
 
 # Feature toggles, set from the command line in main().
-ENABLE_SHELL: bool = True  # Shell button / /api/shell
+ENABLE_SHELL: bool = True  # Tools ▸ Shell / /api/shell
 ENABLE_RUN: bool = True  # run executables / /api/run
-ENABLE_MAKE: bool = True  # automatic rebuilds + manual Make button
+ENABLE_MAKE: bool = True  # automatic rebuilds + the make items in Tools
 ENABLE_B64: bool = True  # base64 upload/download (/api/upload64, /api/download64)
 ENABLE_WRITE: bool = True  # write access (--read-only turns this off)
+ENABLE_DAV: bool = True  # WebDAV mount (davfs2 and friends)
+# First URL segment serving WebDAV (set in main from --dav-path). The mount
+# cannot live at / because the JSON API and the page already own those names.
+DAV_PREFIX = "dav"
 
 # When the process started, reported by /health.
 START_TIME = time.time()
@@ -391,6 +436,20 @@ def pillow_available() -> bool:
 
 def rel_of(p: Path) -> str:
     return "" if p == ROOT else p.relative_to(ROOT).as_posix()
+
+
+def fmt_size(n: float) -> str:
+    """A byte count as short human text, for error messages.
+
+    The limits at the top of the file are written in bytes and quoted to the
+    user, and "1024 MB" reads worse than "1 GB". Rounds like the browser's own
+    formatter does: whole numbers from 10 up, one decimal below.
+    """
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.{0 if n >= 10 or unit == 'B' else 1}f} {unit}"
+        n /= 1024.0
+    return f"{n:.0f} PB"
 
 
 def classify(name: str) -> str:
@@ -846,7 +905,7 @@ def _copy_capped(src: BinaryIO, out: BinaryIO, room: int, name: str) -> int:
             raise HTTPError(
                 413,
                 f"Zip entry {name!r} expands beyond the "
-                f"{MAX_ZIP_TOTAL_SIZE // (1024 * 1024 * 1024)} GB extract limit",
+                f"{fmt_size(MAX_ZIP_TOTAL_SIZE)} extract limit",
             )
         out.write(chunk)
     return written
@@ -875,16 +934,16 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> dict[str, Any]:
             if info.file_size > MAX_ZIP_ENTRY_SIZE:
                 raise HTTPError(
                     413,
-                    f"Zip entry {info.filename!r} is {info.file_size // (1024 * 1024)} MB "
+                    f"Zip entry {info.filename!r} is {fmt_size(info.file_size)} "
                     f"and exceeds the per-entry limit "
-                    f"({MAX_ZIP_ENTRY_SIZE // (1024 * 1024 * 1024)} GB)",
+                    f"({fmt_size(MAX_ZIP_ENTRY_SIZE)})",
                 )
             declared += info.file_size
         if declared > MAX_ZIP_TOTAL_SIZE:
             raise HTTPError(
                 413,
-                f"This zip expands to {declared // (1024 * 1024 * 1024)} GB, over the "
-                f"{MAX_ZIP_TOTAL_SIZE // (1024 * 1024 * 1024)} GB extract limit",
+                f"This zip expands to {fmt_size(declared)}, over the "
+                f"{fmt_size(MAX_ZIP_TOTAL_SIZE)} extract limit",
             )
         entries = 0
         total = 0
@@ -918,6 +977,149 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> dict[str, Any]:
             entries += 1
             total += written
     return {"entries": entries, "bytes": total}
+
+
+# The base64 alphabet, '=' included because padding belongs to a payload (it
+# only ever ends one), and the two byte sets bytes.translate() drops while
+# looking for it: whitespace, because line-wrapped base64 contains some.
+_B64_CHARS = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+)
+_B64_WS = b" \t\r\n"
+_B64_JUNK = bytes(b for b in range(256) if b not in _B64_CHARS)
+_B64_EXPECTED = 'Expected a JSON body of the form {"data": "<base64>"}'
+
+
+def _b64_group(data: bytes) -> bytes:
+    """Decode a whole number of base64 groups, padding the last one."""
+    try:
+        # Characters are checked by the caller; strict_mode catches what is
+        # left: a stray bit of padding in the middle, a lone leftover digit.
+        return binascii.a2b_base64(data + b"=" * (-len(data) % 4), strict_mode=True)
+    except (binascii.Error, ValueError):
+        raise HTTPError(400, "Invalid base64 payload")
+
+
+class _B64PayloadReader:
+    """Pull a base64 payload out of `{"data":"…"}` while the body arrives.
+
+    /api/upload64 used to json.loads() the whole body and decode the string it
+    found: the 1 GB file at the top of the transfer limit arrives as a 1.4 GB
+    body, so one upload needed several gigabytes of RAM. Here the envelope in
+    front of the value is scanned once, the payload is decoded in whole groups
+    of four characters as each chunk lands, and only the beginning of an
+    unfinished group is carried over, so memory does not follow the file.
+
+    Whatever comes after the closing quote is read but ignored, which also
+    drains the socket: that is what keeps the connection usable afterwards.
+    """
+
+    HEAD_MAX = 64 * 1024  # envelope bytes to buffer before calling it a lie
+    PROBE = 4 * 1024  # ... and bytes at the start of the value, for data URLs
+
+    def __init__(self) -> None:
+        self._head = bytearray()  # scanned for the start of the value
+        self._group = bytearray()  # payload characters short of a group of four
+        self._esc = b""  # a backslash at the end of a chunk, waiting for its letter
+        self._in_value = False
+        self._ended = False  # saw the closing quote, or the padding
+        self._chars = 0  # payload characters seen, so an empty one is caught
+
+    def feed(self, chunk: bytes) -> bytes:
+        """Decoded bytes for one chunk of the request body (may be none)."""
+        if not chunk or self._ended:
+            return b""
+        if not self._in_value:
+            self._head += chunk
+            start = self._value_start()
+            if start is None:
+                return b""  # the envelope has not arrived in full yet
+            chunk = bytes(self._head[start:])
+            self._head = bytearray()
+            self._in_value = True
+        quote = chunk.find(b'"')
+        if quote < 0:
+            return self._decode(chunk)
+        data = self._decode(chunk[:quote])
+        self._ended = True
+        return data
+
+    def finish(self) -> bytes:
+        """Decode the last partial group, once the body has been read."""
+        if not self._in_value:
+            raise HTTPError(400, _B64_EXPECTED)
+        if not self._ended:
+            raise HTTPError(400, "The base64 payload ended without its quote")
+        if not self._chars:
+            raise HTTPError(400, "Missing 'data' field (base64 string)")
+        rest = bytes(self._group)
+        self._group.clear()
+        return _b64_group(rest) if rest else b""
+
+    def _value_start(self) -> int | None:
+        """Where the payload begins in _head; None while more is still needed.
+
+        The key is looked for as `"data"`, quotes included: inside a JSON
+        string a quote is always written `\\"`, so this cannot match text.
+        """
+        lead = self._head.lstrip(_B64_WS)
+        if lead and not lead.startswith(b"{"):
+            raise HTTPError(400, _B64_EXPECTED)
+        key = self._head.find(b'"data"')
+        if key < 0:
+            if len(self._head) > self.HEAD_MAX:
+                raise HTTPError(400, _B64_EXPECTED)
+            return None
+        quote = self._head.find(b'"', key + len(b'"data"'))
+        if quote < 0:
+            if len(self._head) > self.HEAD_MAX:
+                raise HTTPError(400, _B64_EXPECTED)
+            return None
+        value = bytes(self._head[quote + 1 :])
+        if value.startswith(b"data:"):  # a data URL is tolerated, as before
+            comma = value.find(b",")
+            if comma < 0:
+                if len(value) > self.PROBE:
+                    raise HTTPError(400, "The data: URL in the body has no comma")
+                return None
+            return quote + 1 + comma + 1
+        if len(value) < 5 and b"data:".startswith(value):
+            return None  # too little of the value to tell the two apart
+        return quote + 1
+
+    def _decode(self, chunk: bytes) -> bytes:
+        # Two C-level passes instead of a per-character loop: this runs over
+        # every byte of the upload and a Python loop would cost minutes.
+        chunk = self._esc + chunk
+        self._esc = b""
+        if chunk.endswith(b"\\"):
+            self._esc = b"\\"  # the escape itself straddles the boundary
+            chunk = chunk[:-1]
+        if b"\\" in chunk:
+            # A payload written by json.dumps(base64.encodebytes(...)) arrives
+            # with its line breaks escaped, as "\n" rather than a newline byte.
+            chunk = (
+                chunk.replace(b"\\n", b"\n")
+                .replace(b"\\r", b"\r")
+                .replace(b"\\t", b" ")
+            )
+        tight = chunk.translate(None, _B64_WS)
+        if len(tight.translate(None, _B64_JUNK)) != len(tight):
+            raise HTTPError(400, "Invalid base64 payload")
+        data = bytes(self._group) + tight if self._group else tight
+        pad = data.find(b"=")
+        if pad >= 0:
+            # Padding ends a payload: what follows it is JSON, not base64.
+            end = (pad // 4 + 1) * 4
+            self._group.clear()
+            self._ended = True
+            body, after = data[:end], data[end:]
+        else:
+            keep = len(data) % 4
+            self._group = bytearray(data[len(data) - keep :]) if keep else bytearray()
+            body, after = data[: len(data) - keep], b""
+        self._chars += len(data) - len(after)
+        return _b64_group(body) if body else b""
 
 
 class _ChunkedZipSink:
@@ -1003,6 +1205,35 @@ def features() -> dict[str, bool]:
         "make": ENABLE_MAKE,
         "b64": ENABLE_B64,
         "write": ENABLE_WRITE,
+        "dav": ENABLE_DAV,
+    }
+
+
+def dav_mount() -> str:
+    """The URL path a WebDAV client mounts, "" when there is none.
+
+    The page shows this so the Help popup can print a URL that is right
+    behind a reverse proxy as well as when the app is reached directly.
+    """
+    return f"/{DAV_PREFIX}/" if ENABLE_DAV else ""
+
+
+def dav_limits() -> dict[str, int]:
+    """The few tuning values the Help popup quotes, so it cannot drift."""
+    return {
+        "transfer": MAX_TRANSFER_SIZE,
+        "text": MAX_TEXT_SIZE,
+        "body": MAX_JSON_BODY_SIZE,
+        "b64": MAX_B64_FILE_SIZE,
+        "b64Body": MAX_B64_BODY_SIZE,
+        "zipEntry": MAX_ZIP_ENTRY_SIZE,
+        "zipTotal": MAX_ZIP_TOTAL_SIZE,
+        "list": LIST_MAX_ENTRIES,
+        "davEntries": DAV_MAX_ENTRIES,
+        "runTimeout": RUN_TIMEOUT,
+        "runMax": RUN_MAX_TIMEOUT,
+        "socket": READ_TIMEOUT,
+        "lockTtl": DAV_LOCK_TTL,
     }
 
 
@@ -1072,7 +1303,8 @@ def render_thumbnail(p: Path) -> tuple[str, bytes]:
         )
 
 
-# The page is static apart from two placeholders, so it is rendered once.
+# The page is static apart from a handful of placeholders, so it is rendered
+# once.
 _PAGE_HTML: bytes | None = None
 
 
@@ -1086,15 +1318,1122 @@ def page_html() -> bytes:
             )
             .replace("__FEATURES__", json.dumps(features()))
             .replace("__MAKE_POLL_MS__", str(MAKE_JOB_POLL_MS))
+            .replace("__DAV_MOUNT__", json.dumps(dav_mount()))
+            .replace("__DAV_LIMITS__", json.dumps(dav_limits()))
             .encode("utf-8")
         )
     return _PAGE_HTML
 
 
 # ---------------------------------------------------------------------------
+# WebDAV (a deliberately small RFC 4918 subset: the target client is davfs2)
+# ---------------------------------------------------------------------------
+# What is implemented: OPTIONS, PROPFIND (Depth 0/1), PROPPATCH, MKCOL, PUT,
+# DELETE, MOVE, COPY, LOCK, UNLOCK, GET and HEAD. That is compliance class 2:
+# locks exist so a file open on the mount cannot be silently clobbered from
+# the browser, and every write carries or checks an ETag so a lost update is
+# refused instead of won.
+#
+# What is not: shared/read locks, Depth: infinite (treated as 1), custom
+# properties (PROPPATCH keeps the exec bit and honestly refuses anything else),
+# partial (Content-Range) uploads, Microsoft's extensions and report/search.
+# None of those are used by davfs2, and each would need a client that misses it.
+DAV_NS = "DAV:"
+# Where Apache's mod_dav put the executable property, and where davfs2 looks
+# for it (it asks for this one by name and spells the value "T" or "F").
+DAV_APACHE_NS = "http://apache.org/dav/props/"
+ET.register_namespace("D", DAV_NS)
+ET.register_namespace("apache", DAV_APACHE_NS)
+
+DAV_ALLOW = (
+    "OPTIONS, PROPFIND, PROPPATCH, MKCOL, PUT, DELETE, MOVE, COPY, LOCK, UNLOCK, "
+    "GET, HEAD"
+)
+# The properties PROPFIND answers are whatever dav_known_props() builds; a
+# client asking for anything else (a custom property) gets a 404 propstat back,
+# which is how it learns that this server does not store it. DAV:executable is
+# the one property that is stored: it is the file's own exec bit, so reporting
+# it costs nothing and PROPPATCH can write it back with a chmod.
+DAV_STATUS_TEXT = {200: "OK", 403: "Forbidden", 404: "Not Found"}
+# The spellings XML gives a boolean false, for a PROPPATCH that writes the
+# exec bit instead of just being told "yes".
+DAV_FALSE = frozenset({"f", "false", "no", "0"})
+
+
+def _dq(tag: str) -> str:
+    """A fully-qualified WebDAV element name, for ElementTree."""
+    return f"{{{DAV_NS}}}{tag}"
+
+
+def _aq(tag: str) -> str:
+    """The same, in the namespace Apache and davfs2 use for the exec bit."""
+    return f"{{{DAV_APACHE_NS}}}{tag}"
+
+
+# Both spellings of the executable bit, so neither kind of client is told it
+# does not exist. They are the same fact about the same file.
+DAV_EXEC_PROPS = (_dq("executable"), _aq("executable"))
+
+
+def dav_href(rel: str, is_dir: bool) -> str:
+    """The URL of an entry under the mount.
+
+    The trailing slash is part of the contract: it is how clients tell a
+    collection from a resource, so a folder without one disappears from the
+    listing or shows up as an empty file.
+    """
+    href = "/" + DAV_PREFIX
+    if rel:
+        href += "/" + quote(rel, safe="/")
+    if is_dir and not href.endswith("/"):
+        href += "/"
+    return href
+
+
+def dav_etag(st: os.stat_result) -> str:
+    """A strong ETag from the two fields that change when content changes."""
+    return f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+
+
+def dav_iso(ts: float) -> str:
+    """creationdate, which the spec mandates as an ISO 8601 timestamp."""
+    # datetime.UTC would be shorter but is 3.11, and this file runs on 3.10.
+    return datetime.fromtimestamp(ts, timezone.utc).strftime(  # noqa: UP017
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def dav_known_props(p: Path, st: os.stat_result, is_dir: bool) -> dict:
+    """The live properties of one entry, keyed by fully-qualified name."""
+    props: dict[str, Any] = {}
+    rtype = ET.Element(_dq("resourcetype"))
+    if is_dir:
+        ET.SubElement(rtype, _dq("collection"))
+    props[_dq("resourcetype")] = rtype
+    if not is_dir:
+        props[_dq("getcontentlength")] = str(st.st_size)
+        ctype, _ = mimetypes.guess_type(p.name)
+        props[_dq("getcontenttype")] = ctype or "application/octet-stream"
+    # A collection gets an ETag too: it changes whenever the folder's contents
+    # change, and clients that ask for one are happier than those that get a
+    # 404 propstat back.
+    props[_dq("getetag")] = dav_etag(st)
+    props[_dq("getlastmodified")] = formatdate(st.st_mtime, usegmt=True)
+    props[_dq("creationdate")] = dav_iso(created_time(st))
+    props[_dq("displayname")] = p.name or (ROOT.name or "/")
+    if stat.S_ISREG(st.st_mode) and st.st_mode & 0o111:
+        # The executable bit, which is the only property with somewhere to live
+        # because it *is* the file. Both spellings are offered: RFC 3253 put it
+        # in DAV: and means "true" by the element being there, while Apache's
+        # mod_dav - and davfs2, which follows it - use its own namespace and
+        # spell the value out. Anything that is not a plain file has no bit to
+        # report, not even a link whose mode happens to be 777.
+        props[_dq("executable")] = ET.Element(_dq("executable"))
+        props[_aq("executable")] = "T"
+    return props
+
+
+def dav_lock_node(lock: dict) -> ET.Element:
+    """An <D:activelock> describing one held lock."""
+    node = ET.Element(_dq("activelock"))
+    ET.SubElement(ET.SubElement(node, _dq("locktype")), _dq("write"))
+    ET.SubElement(ET.SubElement(node, _dq("lockscope")), _dq("exclusive"))
+    ET.SubElement(node, _dq("depth")).text = lock["depth"]
+    if lock["owner"]:
+        ET.SubElement(node, _dq("owner")).text = lock["owner"]
+    ET.SubElement(node, _dq("timeout")).text = f"Second-{lock['timeout']}"
+    ET.SubElement(ET.SubElement(node, _dq("locktoken")), _dq("href")).text = lock[
+        "token"
+    ]
+    ET.SubElement(ET.SubElement(node, _dq("lockroot")), _dq("href")).text = lock["href"]
+    return node
+
+
+def dav_supported_locks() -> ET.Element:
+    node = ET.Element(_dq("supportedlock"))
+    entry = ET.SubElement(node, _dq("lockentry"))
+    ET.SubElement(ET.SubElement(entry, _dq("lockscope")), _dq("exclusive"))
+    ET.SubElement(ET.SubElement(entry, _dq("locktype")), _dq("write"))
+    return node
+
+
+def dav_response(
+    p: Path,
+    rel: str,
+    st: os.stat_result,
+    is_dir: bool,
+    all_props: bool,
+    wanted: set[str],
+) -> ET.Element:
+    """One <D:response> for an entry: the properties that exist here, and a
+    second propstat listing the requested properties that do not."""
+    props = dav_known_props(p, st, is_dir)
+    discovery = ET.Element(_dq("lockdiscovery"))
+    for lock in LOCKS.on_path(str(p)):
+        discovery.append(dav_lock_node(lock))
+    props[_dq("lockdiscovery")] = discovery
+    props[_dq("supportedlock")] = dav_supported_locks()
+
+    known = set(props)
+    ok = [name for name in props if all_props or name in wanted]
+    missing = sorted(name for name in wanted if name not in known)
+
+    resp = ET.Element(_dq("response"))
+    ET.SubElement(resp, _dq("href")).text = dav_href(rel, is_dir)
+    propstat = ET.SubElement(resp, _dq("propstat"))
+    prop = ET.SubElement(propstat, _dq("prop"))
+    for name in ok:
+        value = props[name]
+        if isinstance(value, ET.Element):
+            prop.append(value)
+        else:
+            ET.SubElement(prop, name).text = value
+    ET.SubElement(propstat, _dq("status")).text = "HTTP/1.1 200 OK"
+    if missing:
+        # Honest "this server does not store that": a client asking for its own
+        # properties (or for the exec bit of a file that has none) is not
+        # silently answered with a property that just is not there.
+        propstat = ET.SubElement(resp, _dq("propstat"))
+        prop = ET.SubElement(propstat, _dq("prop"))
+        for name in missing:
+            ET.SubElement(prop, name)
+        ET.SubElement(propstat, _dq("status")).text = "HTTP/1.1 404 Not Found"
+    return resp
+
+
+def dav_requested_props(body: bytes) -> tuple[bool, set[str]]:
+    """(<want everything>, {names}) from a PROPFIND request body.
+
+    A missing or empty body and <allprop/> both mean "everything"; so does
+    <propname/>, because handing back values the client did not ask for is
+    harmless while withholding them is not.
+    """
+    if not body.strip():
+        return True, set()
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        raise HTTPError(400, "Malformed PROPFIND request body")
+    if root.tag != _dq("propfind"):
+        raise HTTPError(400, "Not a PROPFIND request body")
+    if root.find(_dq("allprop")) is not None or root.find(_dq("propname")) is not None:
+        return True, set()
+    wanted: set[str] = set()
+    for prop in root.iter(_dq("prop")):
+        for child in prop:
+            wanted.add(child.tag)
+    if not wanted:
+        return True, set()
+    return False, wanted
+
+
+_DAV_IF_ITEM = re.compile(r"\(([^()]*)\)|<([^>]*)>")
+_DAV_IF_INNER = re.compile(r"<([^>]*)>|\"([^\"]*)\"|([^\s\[\]()+]+)")
+
+
+def dav_conditionals(header: str | None) -> tuple[set[str], set[str]]:
+    """Tokens and entity tags from an `If:` header.
+
+    The full grammar (RFC 4918 §10.4: lists, tuples and path literals that
+    apply to different resources) is far more than davfs2 ever sends: one
+    lock token and, when it wants to avoid losing an update, one entity tag,
+    both for the request URI. So every token and every etag in the header is
+    collected and either may satisfy the condition. That is looser than the
+    spec for a multi-group header and identical for everything davfs2 sends.
+    A `<...>` outside parentheses is a path literal and is ignored.
+    """
+    tokens: set[str] = set()
+    etags: set[str] = set()
+    if not header:
+        return tokens, etags
+    for inside, _literal in _DAV_IF_ITEM.findall(header):
+        if not inside:
+            continue
+        for token, etag, bare in _DAV_IF_INNER.findall(inside):
+            if token:
+                tokens.add(token)
+            elif etag:
+                etags.add(f'"{etag}"')  # quoted, as an ETag header spells it
+            else:
+                # (opaquelocktoken:...) — a token written bare, which several
+                # clients do instead of wrapping it in angle brackets.
+                tokens.add(bare)
+    return tokens, etags
+
+
+def dav_header_tokens(header: str | None) -> set[str]:
+    """Tokens from a Lock-Token header (it holds one, but be forgiving)."""
+    if not header:
+        return set()
+    return {part.strip().strip("<>") for part in header.split(",") if part.strip()}
+
+
+def dav_etag_listed(header: str | None, etag: str | None) -> bool:
+    """True when an If-Match / If-None-Match header names this ETag.
+
+    A weak indicator is ignored on purpose: davfs2 echoes back whatever
+    ETag it got, and treating W/"x" as "x" is what makes its lost-update
+    check work against a server that cannot keep a token per stored version.
+    """
+    if not header or not header.strip():
+        return False
+    for part in header.split(","):
+        part = part.strip()
+        if part.startswith("W/"):
+            part = part[2:].strip()
+        if part == "*" or (etag is not None and part == etag):
+            return True
+    return False
+
+
+def dav_lock_info(body: bytes) -> tuple[str, str, str]:
+    """(scope, type, owner) from a <D:lockinfo> body."""
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        raise HTTPError(400, "Malformed lock request body")
+    if root.tag != _dq("lockinfo"):
+        raise HTTPError(400, "Not a lock request body")
+    scope = "exclusive" if root.find(f".//{_dq('exclusive')}") is not None else "shared"
+    kind = "write" if root.find(f".//{_dq('write')}") is not None else "read"
+    owner = ""
+    node = root.find(f".//{_dq('owner')}")
+    if node is not None:
+        owner = " ".join(" ".join(node.itertext()).split())[:200]
+    return scope, kind, owner
+
+
+def dav_patch_tags(body: bytes) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The properties a <D:propertyupdate> body sets and removes.
+
+    Each name comes with the element's text because that is how a client says
+    "false": <executable>F</executable> asks for the opposite of <executable/>.
+    """
+    if not body.strip():
+        return [], []
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        raise HTTPError(400, "Malformed PROPPATCH request body")
+    if root.tag != _dq("propertyupdate"):
+        raise HTTPError(400, "Not a PROPPATCH request body")
+    found: dict[str, list[tuple[str, str]]] = {"set": [], "remove": []}
+    for verb in ("set", "remove"):
+        for block in root.findall(_dq(verb)):
+            for prop in block.findall(_dq("prop")):
+                for child in prop:
+                    entry = (child.tag, " ".join((child.text or "").split()).lower())
+                    if entry not in found[verb]:
+                        found[verb].append(entry)
+    return found["set"], found["remove"]
+
+
+def dav_if_modified(header: str | None, st: os.stat_result) -> bool | None:
+    """True when the file is unchanged since the date a header names.
+
+    None means the header is absent or unreadable, which is treated as
+    "no condition". Comparison is at second resolution because that is what
+    an HTTP date carries.
+    """
+    if not header or not header.strip():
+        return None
+    try:
+        since = parsedate_to_datetime(header.strip())
+    except (TypeError, ValueError):
+        return None
+    if since is None:
+        return None
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)  # noqa: UP017 (3.10 has no UTC)
+    return int(st.st_mtime) <= int(since.timestamp())
+
+
+def dav_reason_header(value: str | None, name: str) -> str:
+    return (value or name).strip()[:200]
+
+
+class _Locks:
+    """WebDAV write locks, held in memory only.
+
+    davfs2 locks a file when a program opens it for writing and refreshes the
+    lock before its timeout expires. Keeping those locks and honouring them
+    (in both directions: the mount may not clobber a file the browser locked,
+    the browser may not clobber one the mount locked) is the whole reason to
+    implement locking: without them, an editor on the mount and the browser
+    silently race each other.
+
+    A lock that is never refreshed dies with its timeout, so a crashed client
+    or a yanked cable cannot block the file forever. Like the thumbnail and
+    folder-size caches this table is bounded, TTL-expired and purely in
+    memory: a restart clears it and nothing has to be migrated.
+    """
+
+    def __init__(self, ttl: int, max_entries: int) -> None:
+        self._ttl = ttl
+        self._max_entries = max_entries
+        self._by_token: OrderedDict[str, dict] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _sweep(self) -> None:
+        now = time.monotonic()
+        for token in [t for t, l in self._by_token.items() if now >= l["expires"]]:
+            del self._by_token[token]
+
+    def timeout(self, header: str | None) -> int:
+        """Seconds from a `Timeout: Second-1800` header, capped."""
+        value = (header or "").strip().lower()
+        if value.startswith("second-"):
+            try:
+                asked = int(value[len("second-") :].strip())
+            except ValueError:
+                asked = self._ttl
+            return max(30, min(asked, DAV_LOCK_MAX_TIMEOUT))
+        return self._ttl  # Infinity and anything unparsable
+
+    def add(self, path: str, href: str, depth: str, owner: str, timeout: int) -> dict:
+        token = f"opaquelocktoken:{uuid.uuid4()}"
+        record = {
+            "token": token,
+            "path": path,
+            "href": href,
+            "depth": depth,
+            "owner": owner or "unknown",
+            "timeout": timeout,
+            "expires": time.monotonic() + timeout,
+        }
+        with self._lock:
+            self._sweep()
+            self._by_token[token] = record
+            while len(self._by_token) > self._max_entries:
+                self._by_token.popitem(last=False)
+        return record
+
+    def get(self, token: str) -> dict | None:
+        with self._lock:
+            self._sweep()
+            record = self._by_token.get(token)
+            if record is not None:
+                self._by_token.move_to_end(token)
+            return record
+
+    def on_path(self, path: str) -> list[dict]:
+        with self._lock:
+            self._sweep()
+            return [l for l in self._by_token.values() if l["path"] == path]
+
+    def holder(self, path: str) -> dict | None:
+        held = self.on_path(path)
+        return held[-1] if held else None
+
+    def refresh(self, token: str, timeout: int) -> dict | None:
+        """Extend a lock a client already holds (a WebDAV "refresh")."""
+        record = self.get(token)
+        if record is None:
+            return None
+        with self._lock:
+            record["timeout"] = timeout
+            record["expires"] = time.monotonic() + timeout
+        return record
+
+    def blocking(self, path: str, tokens: set[str]) -> dict | None:
+        """The lock that stops an untokened write to path, if there is one.
+
+        A lock with Depth: infinity covers everything underneath it, so the
+        parent folders are checked as well.
+        """
+        with self._lock:
+            self._sweep()
+            held = list(self._by_token.values())
+        current = Path(path)
+        for _ in range(64):  # bounded, so a deep tree cannot spin here
+            for record in held:
+                if record["token"] in tokens or record["path"] != str(current):
+                    continue
+                # The lock is on this path: it blocks the request itself, or,
+                # when it covers a whole tree, everything inside it too.
+                if path == str(current) or record["depth"] == "infinity":
+                    return record
+            if current.parent == current:
+                break
+            current = current.parent
+        return None
+
+    def drop(self, token: str) -> bool:
+        with self._lock:
+            return self._by_token.pop(token, None) is not None
+
+    def drop_blocking(self, path: str) -> int:
+        """Drop every lock that stops an untokened write to path.
+
+        That is a lock on the path itself and a Depth: infinity lock on one of
+        its parent folders. Breaking the ancestor's lock is a wider hammer than
+        the Unlock button sounds like, but it is the only lock the caller can
+        see: the listing says "this folder is locked", and dropping the one on
+        the folder above is what frees it.
+        """
+        with self._lock:
+            self._sweep()
+            gone = [
+                token
+                for token, record in self._by_token.items()
+                if record["path"] == path
+                or (
+                    record["depth"] == "infinity"
+                    and path.startswith(record["path"].rstrip(os.sep) + os.sep)
+                )
+            ]
+            for token in gone:
+                del self._by_token[token]
+            return len(gone)
+
+    def move(self, old: str, new: str) -> None:
+        """Follow an entry that was renamed or moved out from under a lock.
+
+        Locks on entries inside a moved folder travel with it: they were taken
+        through a path that no longer exists, and dropping them silently would
+        hand out write access while a client still believes it holds the file,
+        or block a new file that happens to land on the old name.
+        """
+        old = old.rstrip(os.sep)
+        new = new.rstrip(os.sep)
+        prefix = old + os.sep
+        with self._lock:
+            for record in self._by_token.values():
+                path = record["path"].rstrip(os.sep)
+                if path == old:
+                    record["path"] = new
+                elif path.startswith(prefix):
+                    record["path"] = new + os.sep + path[len(prefix) :]
+
+    def drop_subtree(self, path: str) -> int:
+        prefix = path.rstrip(os.sep) + os.sep
+        with self._lock:
+            gone = [
+                t
+                for t, l in self._by_token.items()
+                if l["path"] == path or l["path"].startswith(prefix)
+            ]
+            for token in gone:
+                del self._by_token[token]
+            return len(gone)
+
+    def count(self) -> int:
+        with self._lock:
+            self._sweep()
+            return len(self._by_token)
+
+    def snapshot(self) -> dict[str, list[dict]]:
+        """path -> locks, for /api/list; the handler only reads this."""
+        with self._lock:
+            self._sweep()
+            out: dict[str, list[dict]] = {}
+            for record in self._by_token.values():
+                out.setdefault(record["path"], []).append(dict(record))
+            return out
+
+
+LOCKS = _Locks(ttl=DAV_LOCK_TTL, max_entries=DAV_MAX_LOCKS)
+
+
+# ---------------------------------------------------------------------------
+# WebDAV verbs
+# ---------------------------------------------------------------------------
+class DavMixin:
+    """The WebDAV half of the handler, mixed into Handler below.
+
+    Every entry point starts with the prefix test, so the page, the JSON API
+    and the mount share one port and one served folder without ever getting
+    in each other's way. Errors leave as JSON carrying the WebDAV status
+    code, which is all davfs2 reads from a failed request (it reports the
+    number, not the body), and that keeps one error path for the whole app —
+    including the awkward part of it: an unread request body has to be
+    drained or the connection closed, because davfs2 retries eagerly and a
+    leftover body would be parsed as the next request.
+
+    Locks and ETags are enforced by the JSON endpoints too, not only by the
+    WebDAV verbs: that is the only reason to have them. A file open in an
+    editor on the mount is refused in the browser with 423 and an Unlock
+    action instead of being quietly overwritten, and the other way round.
+    """
+
+    # -- routing -----------------------------------------------------------
+    def _dav_rel(self) -> str | None:
+        """The decoded path under the mount, or None when this is not for it.
+
+        Decoding happens after splitting, so a name containing a
+        percent-encoded slash stays one name. No Linux name can hold a slash,
+        so that only matters for names with spaces, quotes or non-ASCII
+        characters — which davfs2 sends as UTF-8 with no conversion (its
+        server_charset option is off by default, matching this server).
+        """
+        if not ENABLE_DAV:
+            return None
+        path = urlparse(self.path).path
+        head, _slash, rest = path.lstrip("/").partition("/")
+        if head != DAV_PREFIX:
+            return None
+        return "/".join(
+            unquote(part) for part in rest.split("/") if part not in ("", ".")
+        )
+
+    def dav_dispatch(self, method: str, bodyless: bool = False) -> bool:
+        """Answer the request when it belongs to the mount.
+
+        True means a response went out; False means the caller (do_GET,
+        do_HEAD, do_POST) has routes of its own left to try. bodyless is for
+        HEAD, which must not send the JSON error body.
+        """
+        rel = self._dav_rel()
+        if rel is None:
+            return False
+        endpoint = getattr(self, "_dav_" + method.lower(), None)
+        try:
+            if endpoint is None:
+                raise HTTPError(405, f"{method} is not supported")
+            endpoint(rel)
+        except HTTPError as e:
+            self._fail(e.code, e.msg, bodyless=bodyless)
+        except TimeoutError:
+            self._fail(408, "Timed out reading the request body", bodyless=bodyless)
+        except Exception as e:  # noqa: BLE001
+            self._fail(500, f"Server error: {e}", bodyless=bodyless)
+        return True
+
+    def _dav_only(self, method: str, bodyless: bool = False) -> None:
+        """A verb that exists for the mount only: 405 anywhere else."""
+        if not self.dav_dispatch(method, bodyless=bodyless):
+            self._fail(
+                405,
+                f"{method} is a WebDAV method: it only works under /{DAV_PREFIX}/ "
+                "(the JSON API at /api/* uses GET and POST)",
+                bodyless=bodyless,
+            )
+
+    def do_OPTIONS(self) -> None:
+        self._dav_only("OPTIONS")
+
+    def do_PUT(self) -> None:
+        self._dav_only("PUT")
+
+    def do_DELETE(self) -> None:
+        self._dav_only("DELETE")
+
+    def do_PROPFIND(self) -> None:
+        self._dav_only("PROPFIND")
+
+    def do_PROPPATCH(self) -> None:
+        self._dav_only("PROPPATCH")
+
+    def do_MKCOL(self) -> None:
+        self._dav_only("MKCOL")
+
+    def do_MOVE(self) -> None:
+        self._dav_only("MOVE")
+
+    def do_COPY(self) -> None:
+        self._dav_only("COPY")
+
+    def do_LOCK(self) -> None:
+        self._dav_only("LOCK")
+
+    def do_UNLOCK(self) -> None:
+        self._dav_only("UNLOCK")
+
+    # -- shared helpers ----------------------------------------------------
+    @staticmethod
+    def _dav_stat(p: Path) -> os.stat_result:
+        """stat() following a symlink, or the link itself when that fails.
+
+        A dangling link must not turn a PROPFIND into a 500: davfs2 has no
+        notion of links at all, so such an entry is reported as a plain (odd)
+        file rather than making a whole folder fail to list.
+        """
+        try:
+            return p.stat()
+        except OSError:
+            return p.lstat()
+
+    def _dav_target(self, rel: str) -> tuple[Path, os.stat_result]:
+        """An existing entry the request names, or a 404."""
+        p = safe_path(rel)
+        try:
+            return p, self._dav_stat(p)
+        except OSError:
+            raise HTTPError(404, "Not found")
+
+    def _dav_tokens(self) -> set[str]:
+        """Every lock token the request presents, in either header."""
+        tokens, _etags = dav_conditionals(self.headers.get("If"))
+        return tokens | dav_header_tokens(self.headers.get("Lock-Token"))
+
+    def _dav_unlocked(self, p: Path) -> None:
+        """423 unless no foreign lock covers this path."""
+        held = LOCKS.blocking(str(p), self._dav_tokens())
+        if held is not None:
+            raise HTTPError(
+                423,
+                f"Locked over WebDAV by {held['owner']!r} — close the file on "
+                "the mount, or use the Unlock action in the browser",
+            )
+
+    def _require_unlocked(self, p: Path) -> None:
+        """The check the JSON endpoints use: a browser holds no lock tokens."""
+        self._dav_unlocked(p)
+
+    def _dav_overwrite(self) -> bool:
+        """Overwrite: F means the client wants a name clash refused."""
+        return (self.headers.get("Overwrite") or "T").strip().upper() != "F"
+
+    def _dav_destination(self) -> str:
+        """The relative path a Destination header points at, inside the mount.
+
+        The header arrives as an absolute URL (that is what davfs2 sends) or
+        as a path. A host other than this one is treated as a path too: the
+        result is still confined to the served folder, and replying with a
+        redirect would not help — davfs2 keeps follow_redirect off.
+        """
+        raw = (self.headers.get("Destination") or "").strip().strip("<>")
+        if not raw:
+            raise HTTPError(400, "MOVE and COPY need a Destination header")
+        rest = urlparse(raw).path if "://" in raw else raw
+        head, _slash, tail = rest.lstrip("/").partition("/")
+        if head != DAV_PREFIX:
+            raise HTTPError(
+                400, f"Destination is outside the WebDAV mount (/{DAV_PREFIX}/...)"
+            )
+        dest = "/".join(unquote(p) for p in tail.split("/") if p not in ("", "."))
+        if not dest:
+            raise HTTPError(400, "Destination cannot be the mounted folder itself")
+        return dest
+
+    def _dav_status(self, code: int, headers: dict[str, str] | None = None) -> None:
+        """A status with no body (201, 204): what most writes answer."""
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+
+    def _dav_xml(
+        self, code: int, root: ET.Element, headers: dict[str, str] | None = None
+    ) -> None:
+        self._send(
+            code,
+            ET.tostring(root, encoding="utf-8", xml_declaration=True),
+            "application/xml; charset=utf-8",
+            headers,
+        )
+
+    def _dav_multistatus(self, responses: list[ET.Element]) -> ET.Element:
+        root = ET.Element(_dq("multistatus"))
+        for resp in responses:
+            root.append(resp)
+        return root
+
+    def _dav_changed(self, dirp: Path) -> None:
+        """React to a change that arrived over the mount.
+
+        The make job is queued exactly as it is for a browser edit; only its
+        result has nobody waiting for it, so no popup is opened for it.
+        """
+        self.maybe_run_make(dirp)
+
+    @staticmethod
+    def _dav_replace(p: Path) -> None:
+        """Remove an entry the client is about to replace."""
+        if not entry_exists(p):
+            return
+        if p.is_symlink() or not p.is_dir():
+            p.unlink()
+        else:
+            shutil.rmtree(p)
+
+    # -- verbs -------------------------------------------------------------
+    def _dav_options(self, rel: str) -> None:
+        """The advertisement a client sizes this server up from."""
+        self.send_response(204)
+        self.send_header("DAV", "1, 2")
+        self.send_header("Allow", DAV_ALLOW)
+        self.send_header("MS-Author-Via", "DAV")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _dav_propfind(self, rel: str) -> None:
+        """Report one entry, or a folder and its children (Depth 0/1).
+
+        Depth: infinity is answered as Depth: 1: one request must not become
+        an unbounded walk of a whole tree, and davfs2 never asks for more
+        than a folder's own children anyway.
+        """
+        all_props, wanted = dav_requested_props(self._read_body(DAV_MAX_XML_BODY))
+        depth = (self.headers.get("Depth") or "infinity").strip().lower()
+        p, st = self._dav_target(rel)
+        is_dir = stat.S_ISDIR(st.st_mode)
+        responses = [dav_response(p, rel, st, is_dir, all_props, wanted)]
+        if is_dir and depth != "0":
+            try:
+                scan = os.scandir(p)
+            except OSError:
+                scan = None
+            if scan is not None:
+                with scan:
+                    for de in scan:
+                        if len(responses) > DAV_MAX_ENTRIES:
+                            self.log_message(
+                                "PROPFIND of %r capped at %d entries",
+                                rel,
+                                len(responses),
+                            )
+                            break
+                        try:
+                            child_st = de.stat()
+                        except OSError:
+                            try:
+                                child_st = de.stat(follow_symlinks=False)
+                            except OSError:
+                                continue  # vanished mid-listing
+                        child = (rel + "/" + de.name) if rel else de.name
+                        responses.append(
+                            dav_response(
+                                Path(de.path),
+                                child,
+                                child_st,
+                                stat.S_ISDIR(child_st.st_mode),
+                                all_props,
+                                wanted,
+                            )
+                        )
+        self._dav_xml(207, self._dav_multistatus(responses))
+
+    def _dav_proppatch(self, rel: str) -> None:
+        """Apply the one property that has somewhere to live, refuse the rest.
+
+        That property is the executable bit, in either of its two spellings: it
+        is the file's own exec bit, which is how davfs2 decides whether a file on
+        the mount may be run and what chmod tries to hand back. Everything else
+        has nowhere to be stored here - the app's promise is that the served
+        folder is the only state - so setting it is answered 403, which davfs2
+        copes with by keeping the value locally. A 200 that lied about storing it
+        would be worse.
+        """
+        p, st = self._dav_target(rel)
+        self._require_write("Changing properties")
+        self._dav_unlocked(p)
+        sets, removes = dav_patch_tags(self._read_body(DAV_MAX_XML_BODY))
+        regular = stat.S_ISREG(st.st_mode)
+        done: list[str] = []
+        refused: list[str] = []
+        for verb, tags in (("set", sets), ("remove", removes)):
+            for tag, text in tags:
+                if tag in DAV_EXEC_PROPS and regular:
+                    # <executable/> means true; a client that spells the value
+                    # says what it means, and "F" is as false as "false".
+                    if self._dav_exec_bit(p, verb == "set" and text not in DAV_FALSE):
+                        done.append(tag)
+                    else:
+                        refused.append(tag)
+                else:
+                    refused.append(tag)
+        resp = ET.Element(_dq("response"))
+        ET.SubElement(resp, _dq("href")).text = dav_href(rel, stat.S_ISDIR(st.st_mode))
+        for tags, code in ((done, 200), (refused, 403)):
+            if not tags:
+                continue
+            propstat = ET.SubElement(resp, _dq("propstat"))
+            prop = ET.SubElement(propstat, _dq("prop"))
+            for tag in tags:
+                ET.SubElement(prop, tag)
+            ET.SubElement(
+                propstat, _dq("status")
+            ).text = f"HTTP/1.1 {code} {DAV_STATUS_TEXT[code]}"
+        self._dav_xml(207, self._dav_multistatus([resp]))
+
+    def _dav_exec_bit(self, p: Path, on: bool) -> bool:
+        """Move the exec bit for a PROPPATCH; False when the file refuses."""
+        try:
+            mode = p.stat().st_mode
+            p.chmod(mode | 0o111 if on else mode & ~0o111)
+        except OSError:
+            return False
+        return True
+
+    def _dav_get(self, rel: str) -> None:
+        self._dav_stream(rel, head_only=False)
+
+    def _dav_head(self, rel: str) -> None:
+        self._dav_stream(rel, head_only=True)
+
+    def _dav_stream(self, rel: str, head_only: bool) -> None:
+        """GET/HEAD of a file, with the conditionals davfs2 caches with."""
+        p, st = self._dav_target(rel)
+        if stat.S_ISDIR(st.st_mode):
+            raise HTTPError(
+                405,
+                "A folder has no content of its own: it is listed with "
+                "PROPFIND (and browsed at / by the browser interface)",
+            )
+        # No lock check: an exclusive write lock says nothing about reading,
+        # and refusing GET would stop the mount (and everyone else) from
+        # reading a file an editor on another mount happens to have open.
+        etag = dav_etag(st)
+        inm = self.headers.get("If-None-Match")
+        if (inm and dav_etag_listed(inm, etag)) or dav_if_modified(
+            self.headers.get("If-Modified-Since"), st
+        ):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        imm = self.headers.get("If-Match")
+        if imm and not dav_etag_listed(imm, etag):
+            raise HTTPError(412, "That is not the version you asked for")
+        self.stream_file(p, attachment=False, head_only=head_only, dav=True)
+
+    def _dav_post(self, rel: str) -> None:
+        """Plain POST is not part of WebDAV; only the -extended variants are."""
+        raise HTTPError(501, "This WebDAV mount does not implement POST")
+
+    def _dav_mkcol(self, rel: str) -> None:
+        self._require_write("Creating folders")
+        if not rel:
+            raise HTTPError(405, "The mounted folder already exists")
+        p = safe_path(rel)
+        if entry_exists(p):
+            raise HTTPError(405, "A folder with that name already exists")
+        self._require_unlocked(p)
+        # Unlike the browser API, WebDAV forbids creating several levels at
+        # once, so a missing parent is a conflict, not something to fix up.
+        if not p.parent.is_dir():
+            raise HTTPError(409, "The parent folder does not exist")
+        with os_errors("Could not create the folder"):
+            p.mkdir()
+        sizes_changed(p.parent)
+        self._dav_changed(p.parent)
+        self._dav_status(201)
+
+    def _dav_put(self, rel: str) -> None:
+        """Store a whole file — davfs2 re-uploads the entire file, always."""
+        self._require_write("Uploading")
+        if not rel:
+            raise HTTPError(405, "The mounted folder cannot be replaced")
+        p = safe_path(rel)
+        self._dav_unlocked(p)
+        if not p.parent.is_dir():
+            raise HTTPError(409, "The parent folder does not exist")
+        if self.headers.get("Content-Range"):
+            raise HTTPError(501, "Partial (Content-Range) uploads are not supported")
+        before: os.stat_result | None = None
+        if entry_exists(p):
+            before = self._dav_stat(p)
+            if stat.S_ISDIR(before.st_mode):
+                raise HTTPError(405, "That name is a folder")
+        old_etag = dav_etag(before) if before else None
+        if_unmod = self.headers.get("If-Unmodified-Since")
+        _tokens, if_etags = dav_conditionals(self.headers.get("If"))
+        refused = [
+            # If-None-Match names the version that must not be there (or *).
+            before is not None
+            and dav_etag_listed(self.headers.get("If-None-Match"), old_etag),
+            bool(self.headers.get("If-Match"))
+            and not dav_etag_listed(self.headers.get("If-Match"), old_etag),
+            before is not None
+            and bool(if_unmod)
+            and dav_if_modified(if_unmod, before) is False,
+            # An etag inside If: is davfs2's "do not lose my newer file".
+            bool(if_etags) and (old_etag is None or old_etag not in if_etags),
+        ]
+        if any(refused):
+            raise HTTPError(412, "The file changed since you read it")
+        # Written to a temporary name and swapped in: a client that gives up
+        # half way through an upload (davfs2 retries up to
+        # max_upload_attempts times) must not leave a half file where a
+        # reader — the browser or another mount — takes it for the real thing.
+        tmp = p.with_name(f"{p.name}.uploading-{uuid.uuid4().hex[:8]}")
+        with os_errors("Upload failed"):
+            try:
+                size = self._read_body_to_file(tmp)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
+                raise
+            if before is not None:
+                # os.replace swaps the inode, so carry the old permissions
+                # over: a +x script must not lose its bit by being edited on
+                # the mount.
+                with contextlib.suppress(OSError):
+                    os.chmod(tmp, stat.S_IMODE(before.st_mode))
+            os.replace(tmp, p)
+            etag = dav_etag(p.stat())
+        sizes_changed(p.parent)
+        self._dav_changed(p.parent)
+        self._dav_status(
+            204 if before is not None else 201,
+            {"ETag": etag, "X-FM-Bytes": str(size)},
+        )
+
+    def _dav_delete(self, rel: str) -> None:
+        self._require_write("Deleting")
+        if not rel:
+            raise HTTPError(400, "Cannot delete the mounted folder")
+        p = safe_path(rel)
+        self._dav_unlocked(p)
+        if not entry_exists(p):
+            raise HTTPError(404, "Not found")
+        parent = p.parent
+        with os_errors("Could not delete"):
+            # Files and links (even to a folder): the entry itself, never
+            # whatever a link happens to point at. A plain folder goes with
+            # its contents, because WebDAV deletes a collection recursively.
+            if p.is_symlink() or not p.is_dir():
+                p.unlink()
+            else:
+                shutil.rmtree(p)
+        LOCKS.drop_subtree(str(p))
+        sizes_changed(parent)
+        self._dav_changed(parent)
+        self._dav_status(204)
+
+    def _dav_move(self, rel: str) -> None:
+        self._require_write("Moving")
+        if not rel:
+            raise HTTPError(400, "Cannot move the mounted folder")
+        src = safe_path(rel)
+        if not entry_exists(src):
+            raise HTTPError(404, "Not found")
+        self._dav_unlocked(src)
+        dest = safe_path(self._dav_destination())
+        if dest == src:
+            raise HTTPError(400, "That is already its name")
+        self._dav_unlocked(dest.parent)
+        if src.is_dir() and src in dest.parents:
+            raise HTTPError(400, "Cannot move a folder into itself")
+        existed = entry_exists(dest)
+        if existed and not self._dav_overwrite():
+            raise HTTPError(412, "A file or folder with that name is already there")
+        with os_errors("Could not move"):
+            # MOVE replaces the destination, and clearing it first lets a
+            # rename inside one filesystem be the single atomic os.rename.
+            self._dav_replace(dest)
+            if src.parent == dest.parent:
+                os.rename(src, dest)
+            else:
+                shutil.move(str(src), str(dest))
+        LOCKS.move(str(src), str(dest))
+        sizes_changed(src.parent)
+        sizes_changed(dest.parent)
+        self._dav_changed(src.parent)
+        self._dav_changed(dest.parent)
+        self._dav_status(204 if existed else 201)
+
+    def _dav_copy(self, rel: str) -> None:
+        self._require_write("Copying")
+        src, _st = self._dav_target(rel)
+        dest = safe_path(self._dav_destination())
+        if dest == src or src in dest.parents:
+            raise HTTPError(400, "Cannot copy a folder into itself")
+        self._dav_unlocked(dest.parent)
+        # Copying onto a collection puts the copy inside it: that is what the
+        # spec says and what a client that just PROPFINDed the target expects.
+        if dest.is_dir():
+            dest = dest / src.name
+        existed = entry_exists(dest)
+        if existed and not self._dav_overwrite():
+            raise HTTPError(412, "A file or folder with that name is already there")
+        shallow = (self.headers.get("Depth") or "infinity").strip() == "0"
+        with os_errors("Could not copy"):
+            self._dav_replace(dest)
+            dav_copy_entry(src, dest, shallow)
+        sizes_changed(dest.parent)
+        self._dav_changed(dest.parent)
+        self._dav_status(204 if existed else 201)
+
+    def _dav_lock(self, rel: str) -> None:
+        """Take, refresh or reuse an exclusive write lock on one path."""
+        self._require_write("Locking files")
+        p = safe_path(rel)
+        timeout = LOCKS.timeout(self.headers.get("Timeout"))
+        tokens = self._dav_tokens()
+        held = next((LOCKS.get(t) for t in tokens if LOCKS.get(t)), None)
+        body = self._read_body(DAV_MAX_XML_BODY)
+        if not body.strip():
+            # A LOCK with no body is a refresh of a lock the client holds.
+            if held is None:
+                raise HTTPError(409, "Unknown lock token")
+            self._dav_lock_reply(LOCKS.refresh(held["token"], timeout) or held)
+            return
+        scope, kind, owner = dav_lock_info(body)
+        if kind != "write":
+            raise HTTPError(400, "Only write locks are supported")
+        if scope != "exclusive":
+            raise HTTPError(400, "Only exclusive locks are supported")
+        if held is not None and held["path"] == str(p):
+            # Re-locking the file this token already locks is a refresh.
+            self._dav_lock_reply(LOCKS.refresh(held["token"], timeout) or held)
+            return
+        earlier = LOCKS.holder(str(p))
+        if earlier is not None:
+            # A mount that died without unlocking leaves its lock behind, and
+            # the owner string is how a client recognises its own: the same
+            # owner takes over, a different one means the file is busy.
+            if earlier["owner"] != (owner or "unknown"):
+                raise HTTPError(
+                    423, f"Already locked over WebDAV by {earlier['owner']!r}"
+                )
+            LOCKS.drop(earlier["token"])
+        depth = "infinity" if (self.headers.get("Depth") or "") == "infinity" else "0"
+        record = LOCKS.add(str(p), dav_href(rel, p.is_dir()), depth, owner, timeout)
+        self._dav_lock_reply(record)
+
+    def _dav_lock_reply(self, lock: dict) -> None:
+        root = ET.Element(_dq("prop"))
+        ET.SubElement(root, _dq("lockdiscovery")).append(dav_lock_node(lock))
+        self._dav_xml(200, root, {"Lock-Token": f"<{lock['token']}>"})
+
+    def _dav_unlock(self, rel: str) -> None:
+        self._require_write("Unlocking files")
+        tokens = self._dav_tokens()
+        if not tokens:
+            raise HTTPError(400, "UNLOCK needs a Lock-Token header")
+        record = next((LOCKS.get(t) for t in tokens if LOCKS.get(t)), None)
+        if record is None:
+            raise HTTPError(409, "Unknown lock token")
+        if record["path"] != str(safe_path(rel)):
+            raise HTTPError(400, "That lock belongs to a different entry")
+        LOCKS.drop(record["token"])
+        self._dav_status(204)
+
+
+def dav_copy_entry(src: Path, dest: Path, shallow: bool) -> None:
+    """Copy a file, or a whole folder (Depth: 0 takes only its plain files).
+
+    Depth: 0 on a collection means "the folder and its immediate files", so
+    subfolders are left out instead of being followed; links are copied as
+    links, which is what the browser API does too.
+    """
+    if src.is_dir():
+        if not shallow:
+            shutil.copytree(src, dest, symlinks=True)
+            return
+        dest.mkdir()
+        with os.scandir(src) as scan:
+            for de in scan:
+                try:
+                    if de.is_dir(follow_symlinks=False):
+                        continue
+                    shutil.copy2(de.path, dest / de.name, follow_symlinks=False)
+                except OSError:
+                    continue  # one unreadable child does not fail the COPY
+    elif src.is_symlink():
+        os.symlink(os.readlink(src), dest)
+    else:
+        shutil.copy2(src, dest)
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
-class Handler(BaseHTTPRequestHandler):
+class Handler(DavMixin, BaseHTTPRequestHandler):
     server_version = f"FileManager/{VERSION}"
     protocol_version = "HTTP/1.1"
     # A client that sends a header or body byte and then stalls can no longer
@@ -1110,6 +2449,8 @@ class Handler(BaseHTTPRequestHandler):
     # "unread" | "done" | "unknown": whether the request body can still be
     # skipped without breaking keep-alive; see _body_chunks and _fail.
     _body_state = "unread"
+    # True while waiting for a request line on an idle keep-alive socket.
+    _at_boundary = False
 
     # -- per-request plumbing ----------------------------------------------
     def handle_one_request(self) -> None:
@@ -1122,13 +2463,33 @@ class Handler(BaseHTTPRequestHandler):
         client gets a 501 for a request it never sent.
         """
         self._begin_request()
+        self._at_boundary = True
         super().handle_one_request()
+        self._at_boundary = False
         if (
             self._body_state == "unread"
             and not self.close_connection
             and not self._drain_body()
         ):
             self.close_connection = True
+
+    def parse_request(self) -> bool:
+        self._at_boundary = False
+        return super().parse_request()
+
+    def log_error(self, fmt: str, *args: Any) -> None:
+        """Drop the one message that is not an error.
+
+        The stock handler reports a socket timeout as a failed request, but a
+        client that keeps a connection open and then goes quiet for longer than
+        READ_TIMEOUT has not failed anything: a mounted davfs2 does exactly that
+        between two folder refreshes, and the line made the log look broken. The
+        socket is still closed. A timeout in the middle of a request - a stalled
+        body or a client that stopped reading - is logged as before.
+        """
+        if self._at_boundary and "timed out" in fmt:
+            return
+        super().log_error(fmt, *args)
 
     # -- request logging ---------------------------------------------------
     def _client_ua(self) -> str:
@@ -1184,13 +2545,21 @@ class Handler(BaseHTTPRequestHandler):
             code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8"
         )
 
-    def send_error_json(self, code: int, msg: str, keep_alive: bool = False) -> None:
+    def send_error_json(
+        self,
+        code: int,
+        msg: str,
+        keep_alive: bool = False,
+        extra: dict[str, str] | None = None,
+    ) -> None:
         try:
             body = json.dumps({"error": msg}).encode("utf-8")
             self.close_connection = not keep_alive
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
             if not keep_alive:
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -1198,7 +2567,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             self.close_connection = True
 
-    def _fail(self, code: int, msg: str, bodyless: bool = False) -> None:
+    def _fail(
+        self,
+        code: int,
+        msg: str,
+        bodyless: bool = False,
+        extra: dict[str, str] | None = None,
+    ) -> None:
         """Report an error as JSON, reusing the connection where that is safe.
 
         An error is usually raised before any output has been written, so the
@@ -1206,20 +2581,27 @@ class Handler(BaseHTTPRequestHandler):
         connection from being reused: such a body is drained when it is small
         enough to discard cheaply. Once headers are on the wire the response
         is already committed, so the connection has to go.
+
+        bodyless is for HEAD, which must not send a body at all.
         """
         if bodyless:
             self.send_response(code)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if extra is None and code == 405:
+            # RFC 9110 wants an Allow header on a 405, and which set applies
+            # depends on which half of the server the URL belongs to.
+            mount = self._dav_rel() is not None
+            extra = {"Allow": DAV_ALLOW if mount else "GET, HEAD, POST, OPTIONS"}
         if self._resp_started:
-            self.send_error_json(code, msg)
+            self.send_error_json(code, msg, extra=extra)
             return
         keep_alive = self._body_state == "unread" and self._drain_body()
-        self.send_error_json(code, msg, keep_alive=keep_alive)
+        self.send_error_json(code, msg, keep_alive=keep_alive, extra=extra)
 
-    def _fail_http(self, err: HTTPError) -> None:
-        self._fail(err.code, err.msg)
+    def _fail_http(self, err: HTTPError, extra: dict[str, str] | None = None) -> None:
+        self._fail(err.code, err.msg, extra=extra)
 
     def _body_chunks(self) -> Iterator[bytes]:
         """Yield the request body, for both Content-Length and chunked bodies.
@@ -1283,7 +2665,7 @@ class Handler(BaseHTTPRequestHandler):
             if size > limit:
                 raise HTTPError(
                     413,
-                    f"Request body is too large (limit {limit // (1024 * 1024)} MB)",
+                    f"Request body is too large (limit {fmt_size(limit)})",
                 )
             parts.append(chunk)
         self._body_state = "done"
@@ -1299,6 +2681,42 @@ class Handler(BaseHTTPRequestHandler):
                 out.write(chunk)
         self._body_state = "done"
         return size
+
+    def _read_b64_to_file(self, dest: Path, max_bytes: int) -> int:
+        """Decode a base64 JSON body into dest; return the decoded byte count.
+
+        Decoded as it arrives rather than through json.loads(), so a request
+        cannot make the server hold a whole file in memory (see
+        _B64PayloadReader). A failure here leaves no half-written file.
+        """
+        reader = _B64PayloadReader()
+        too_big = (
+            f"Upload is too large for base64 transfer "
+            f"(limit {fmt_size(max_bytes)}) — use the regular upload instead"
+        )
+        written = 0
+        self._body_state = "unknown"
+        try:
+            with dest.open("wb") as out:
+                for chunk in self._body_chunks():
+                    data = reader.feed(chunk)
+                    if not data:
+                        continue
+                    written += len(data)
+                    out.write(data)
+                    if written > max_bytes:
+                        raise HTTPError(413, too_big)
+                tail = reader.finish()
+                written += len(tail)
+                out.write(tail)
+                if written > max_bytes:
+                    raise HTTPError(413, too_big)
+        except Exception:
+            with contextlib.suppress(OSError):
+                dest.unlink(missing_ok=True)
+            raise
+        self._body_state = "done"
+        return written
 
     def _drain_body(self, limit: int = 4 * 1024 * 1024) -> bool:
         """Discard an unread request body; False means close the connection."""
@@ -1393,6 +2811,9 @@ class Handler(BaseHTTPRequestHandler):
                 "root": ROOT.name or str(ROOT),
                 "read_only": not ENABLE_WRITE,
                 "pillow": pillow_available(),
+                "dav": ENABLE_DAV,
+                "dav_prefix": f"/{DAV_PREFIX}" if ENABLE_DAV else None,
+                "locks": LOCKS.count(),
             }
         ).encode("utf-8")
         if head_only:
@@ -1400,15 +2821,29 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(200, body, "application/json; charset=utf-8")
 
-    def stream_file(self, p: Path, attachment: bool, head_only: bool = False) -> None:
+    def stream_file(
+        self,
+        p: Path,
+        attachment: bool,
+        head_only: bool = False,
+        dav: bool = False,
+    ) -> None:
         """Send a file, honouring a single byte Range so media can seek and
-        downloads can resume; HEAD gets the same headers without the body."""
+        downloads can resume; HEAD gets the same headers without the body.
+
+        The ETag and Last-Modified are the same values the WebDAV half reports,
+        so a file read through both doors looks like one file. A DAV response
+        leaves out Content-Disposition — davfs2 has no use for it — and says
+        no-cache instead of no-store, because its whole design is to revalidate
+        with those two headers rather than to refetch.
+        """
         ctype, _ = mimetypes.guess_type(p.name)
         ctype = ctype or "application/octet-stream"
         try:
-            size = p.stat().st_size
+            st = p.stat()
         except OSError:
             raise HTTPError(404, "File not found")
+        size = st.st_size
         start, end = 0, max(size - 1, 0)
         partial = False
         header = self.headers.get("Range")
@@ -1422,10 +2857,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(max(end - start + 1, 0)))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Disposition", content_disposition(mode, p.name))
+        self.send_header("ETag", dav_etag(st))
+        self.send_header("Last-Modified", formatdate(st.st_mtime, usegmt=True))
+        if not dav:
+            self.send_header("Content-Disposition", content_disposition(mode, p.name))
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-cache" if dav else "no-store")
         self.end_headers()
         if head_only:
             return
@@ -1449,7 +2887,9 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
             path = parsed.path
-            if path == "/":
+            if self.dav_dispatch("GET"):
+                pass
+            elif path == "/":
                 self.send_html()
             elif path == "/health":
                 self.ep_health()
@@ -1487,7 +2927,9 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
             path = parsed.path
-            if path == "/":
+            if self.dav_dispatch("HEAD", bodyless=True):
+                pass
+            elif path == "/":
                 self._head_only(200, "text/html; charset=utf-8", len(page_html()))
             elif path == "/health":
                 self.ep_health(head_only=True)
@@ -1523,7 +2965,9 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
             path = parsed.path
-            if path == "/api/mkdir":
+            if self.dav_dispatch("POST"):
+                pass
+            elif path == "/api/mkdir":
                 self.ep_mkdir(qs)
             elif path == "/api/newfile":
                 self.ep_newfile(qs)
@@ -1539,6 +2983,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.ep_move(qs)
             elif path == "/api/copy":
                 self.ep_copy(qs)
+            elif path == "/api/unlock":
+                self.ep_unlock(qs)
             elif path == "/api/foldersize":
                 self.ep_foldersize(qs)
             elif path == "/api/extract":
@@ -1568,6 +3014,9 @@ class Handler(BaseHTTPRequestHandler):
         prefix = rel_of(p)
         have_pillow = pillow_available()
         entries: list[dict[str, Any]] = []
+        # Locks are per absolute path; one snapshot per listing keeps the cost
+        # at one pass over the (small, TTL-bounded) table.
+        held_locks = LOCKS.snapshot() if ENABLE_DAV else {}
         try:
             it = os.scandir(p)
         except OSError:
@@ -1603,6 +3052,15 @@ class Handler(BaseHTTPRequestHandler):
                         "run": ENABLE_RUN and is_reg and is_executable(de.path, st),
                         "link": link_target(de.path) if is_link else None,
                         "broken": not is_dir and not is_reg,
+                        # A lock held by a WebDAV client: the browser cannot
+                        # write to this entry until it is released, so the row
+                        # says so and offers Unlock instead of failing on save.
+                        "locked": bool(held_locks.get(de.path)),
+                        "lock_owner": (
+                            held_locks[de.path][-1]["owner"]
+                            if held_locks.get(de.path)
+                            else None
+                        ),
                     }
                 )
         total = len(entries)
@@ -1615,6 +3073,9 @@ class Handler(BaseHTTPRequestHandler):
         parent = None
         if p != ROOT:
             parent = "" if p.parent == ROOT else rel_of(p.parent)
+        # The folder itself can be locked too (a Depth: infinity lock covers
+        # everything under it), which stops creating or deleting entries here.
+        here_blocked = LOCKS.blocking(str(p), set()) if ENABLE_DAV else None
         self.send_json(
             {
                 "path": rel_of(p),
@@ -1622,12 +3083,15 @@ class Handler(BaseHTTPRequestHandler):
                 "entries": entries,
                 "total": total,
                 "truncated": truncated,
+                "locked": here_blocked is not None,
+                "lock_owner": here_blocked["owner"] if here_blocked else None,
             }
         )
 
     def ep_mkdir(self, qs: Qs) -> None:
         self._require_write("Creating folders")
         p = safe_path(qs.get("path", [""])[0])
+        self._require_unlocked(p)
         if p == ROOT:
             raise HTTPError(400, "Cannot modify the root directory")
         validate_new_name(p.name)
@@ -1644,6 +3108,7 @@ class Handler(BaseHTTPRequestHandler):
         """Create an empty file (used by the 'New text file' menu item)."""
         self._require_write("Creating files")
         p = safe_path(qs.get("path", [""])[0])
+        self._require_unlocked(p)
         if p == ROOT:
             raise HTTPError(400, "Cannot create a file at the root path")
         validate_new_name(p.name)
@@ -1659,6 +3124,7 @@ class Handler(BaseHTTPRequestHandler):
     def ep_delete(self, qs: Qs) -> None:
         self._require_write("Deleting")
         p = safe_path(qs.get("path", [""])[0])
+        self._require_unlocked(p)
         if p == ROOT:
             raise HTTPError(400, "Cannot delete the root directory")
         if not entry_exists(p):
@@ -1671,12 +3137,14 @@ class Handler(BaseHTTPRequestHandler):
                 # Files, symlinks (even to a folder) and special entries: remove
                 # the entry itself, never whatever a link happens to point at.
                 p.unlink()
+        LOCKS.drop_subtree(str(p))  # locks on something gone are meaningless
         sizes_changed(parent)
         self.send_json(self.make_hint({"ok": True}, parent))
 
     def ep_rename(self, qs: Qs) -> None:
         self._require_write("Renaming")
         p = safe_path(qs.get("path", [""])[0])
+        self._require_unlocked(p)
         if p == ROOT:
             raise HTTPError(400, "Cannot rename the root directory")
         if not entry_exists(p):
@@ -1693,6 +3161,7 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(409, "A file or folder with that name already exists here")
         with os_errors("Could not rename"):
             p.rename(dest)
+        LOCKS.move(str(p), str(dest))  # a lock on the mount follows the rename
         sizes_changed(p.parent)
         self.send_json(
             self.make_hint(
@@ -1715,10 +3184,12 @@ class Handler(BaseHTTPRequestHandler):
         dest_dir = safe_path(dest_rel)
         if not dest_dir.is_dir():
             raise HTTPError(404, "Destination folder not found")
+        self._require_unlocked(dest_dir)
         return p, dest_dir
 
     def ep_move(self, qs: Qs) -> None:
         p, dest_dir = self._move_copy_target(qs, "move")
+        self._require_unlocked(p)
         # Can't move a directory into itself or a subdirectory of itself
         if is_link_to_dir(p) and (dest_dir == p or p in dest_dir.parents):
             raise HTTPError(400, "Cannot move a folder into itself or its subfolder")
@@ -1731,6 +3202,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         with os_errors("Could not move"):
             shutil.move(str(p), str(dest))
+        LOCKS.move(str(p), str(dest))
         sizes_changed(p.parent)
         sizes_changed(dest_dir)
         resp = {"ok": True, "path": rel_of(dest), "name": p.name}
@@ -1755,6 +3227,21 @@ class Handler(BaseHTTPRequestHandler):
         sizes_changed(dest_dir)
         resp = {"ok": True, "path": rel_of(dest), "name": dest.name}
         self.send_json(self.make_hint(resp, dest_dir))
+
+    def ep_unlock(self, qs: Qs) -> None:
+        """Break the WebDAV locks keeping one entry busy, from the browser.
+
+        This is recovery, not permission: a mount whose client died leaves a
+        lock that outlives its owner, and without this the only ways to edit
+        the file from here would be to wait for the timeout or to shell out to
+        cadaver. Answering 200 with nothing unlocked is right when the lock
+        expired in the meantime: that is the state the caller wanted.
+        """
+        if not ENABLE_DAV:
+            raise HTTPError(403, "WebDAV is disabled (started with --no-dav)")
+        self._require_write("Unlocking files")
+        p = safe_path(qs.get("path", [""])[0])
+        self.send_json({"ok": True, "unlocked": LOCKS.drop_blocking(str(p))})
 
     def ep_tree(self, qs: Qs) -> None:
         """Return a minimal folder tree for the move-to picker."""
@@ -1812,7 +3299,7 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(
                 413,
                 f"File is too large to edit in the browser "
-                f"(limit {MAX_TEXT_SIZE // (1024 * 1024)} MB) — download it instead",
+                f"(limit {fmt_size(MAX_TEXT_SIZE)}) — download it instead",
             )
         raw = p.read_bytes()
         try:
@@ -1835,6 +3322,7 @@ class Handler(BaseHTTPRequestHandler):
     def ep_save(self, qs: Qs) -> None:
         self._require_write("Editing files")
         p = safe_path(qs.get("path", [""])[0])
+        self._require_unlocked(p)
         if p == ROOT or p.is_dir():
             raise HTTPError(400, "Target is not a file")
         payload = self._json_body()
@@ -1902,6 +3390,7 @@ class Handler(BaseHTTPRequestHandler):
         if not name or name in (".", ".."):
             raise HTTPError(400, "Invalid filename")
         dest = unique_dest(dest_dir, name)
+        self._require_unlocked(dest)
         with os_errors("Upload failed"):
             try:
                 # Streams straight to disk and knows chunked bodies: a body
@@ -1921,7 +3410,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def ep_upload64(self, qs: Qs) -> None:
         """Receive a file as base64 in a JSON body (workaround for flaky
-        binary uploads): {"data": "<base64>"}. A data-URL prefix is accepted."""
+        binary uploads): {"data": "<base64>"}. A data-URL prefix is accepted.
+
+        The payload is decoded to disk as it arrives, so a transfer at the top
+        of the limit costs the server a megabyte of memory instead of about
+        four times the file.
+        """
         if not ENABLE_B64:
             raise HTTPError(403, "Base64 upload is disabled (started with --no-b64)")
         self._require_write("Uploading")
@@ -1936,28 +3430,19 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(
                 413,
                 f"Upload is too large for base64 transfer "
-                f"(limit {MAX_B64_BODY_SIZE // (1024 * 1024)} MB body) — "
+                f"(limit {fmt_size(MAX_B64_BODY_SIZE)} of JSON body) — "
                 f"use the regular upload instead",
             )
-        payload = self._json_body(MAX_B64_BODY_SIZE)
-        data = payload.get("data")
-        if not isinstance(data, str) or not data:
-            raise HTTPError(400, "Missing 'data' field (base64 string)")
-        if data.startswith("data:"):  # tolerate a full data URL
-            comma = data.find(",")
-            if comma > 0:
-                data = data[comma + 1 :]
-        try:
-            raw = base64.b64decode(data, validate=True)
-        except (binascii.Error, ValueError):
-            raise HTTPError(400, "Invalid base64 payload")
+        # The destination is settled before the body is read: a 1.4 GB upload
+        # should fail on a locked name without first being streamed up.
         dest = unique_dest(dest_dir, name)
+        self._require_unlocked(dest)
         with os_errors("Upload failed"):
-            dest.write_bytes(raw)
+            size = self._read_b64_to_file(dest, MAX_B64_FILE_SIZE)
         sizes_changed(dest_dir)
         self.send_json(
             self.make_hint(
-                {"ok": True, "path": rel_of(dest), "name": dest.name, "size": len(raw)},
+                {"ok": True, "path": rel_of(dest), "name": dest.name, "size": size},
                 dest_dir,
             )
         )
@@ -1966,9 +3451,10 @@ class Handler(BaseHTTPRequestHandler):
         """Return a file base64-encoded in a JSON body (workaround for
         flaky binary downloads): the browser decodes it into a Blob.
 
-        The base64 payload is streamed in 3 MB chunks, so memory stays
-        flat no matter how large the file is (the cap below still applies,
-        because the browser holds the whole result in RAM as a Blob).
+        The base64 payload is streamed in 3 MB chunks and the page decodes it
+        as it arrives, so neither end holds the encoded form of a 1 GB file;
+        the cap below still applies because the browser keeps the finished
+        Blob in memory until the download has been handed to the user.
         """
         if not ENABLE_B64:
             raise HTTPError(403, "Base64 download is disabled (started with --no-b64)")
@@ -1978,7 +3464,7 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(
                 413,
                 f"File is too large for base64 transfer "
-                f"(limit {MAX_B64_FILE_SIZE // (1024 * 1024)} MB) — use the "
+                f"(limit {fmt_size(MAX_B64_FILE_SIZE)}) — use the "
                 f"regular Download instead",
             )
         head = (
@@ -2025,6 +3511,9 @@ class Handler(BaseHTTPRequestHandler):
         dest_dir = safe_path(dest_rel) if dest_rel else p.parent
         if not dest_dir.is_dir():
             raise HTTPError(404, "Destination folder not found")
+        self._require_unlocked(dest_dir)
+        if payload.get("delete"):
+            self._require_unlocked(p)
         with os_errors("Extraction failed"):
             result = extract_zip(p, dest_dir)
             if payload.get("delete"):
@@ -2068,7 +3557,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def ep_make(self, qs: Qs) -> None:
-        """Run make in a folder on demand (header "Make" button).
+        """Run make in a folder on demand (Tools ▸ Run make here).
 
         Unlike the automatic runs, this ignores the client's auto-make
         preference: the user explicitly asked for it.
@@ -2266,16 +3755,25 @@ header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px
 .btn-primary{background:var(--primary);border-color:var(--primary);color:#fff}
 .btn-primary:hover{background:var(--primary-d)}
 #themeBtn{font-size:16px;line-height:1;padding:8px 11px}
-#makeBtn{padding:8px 11px;font-size:13px}
-#makeRunBtn{padding:8px 11px;font-size:13px}
-#makeBtn[aria-pressed="false"]{color:var(--muted);border-style:dashed}
-html[data-theme="dark"] #makeBtn[aria-pressed="false"]{color:#7fe9ff;border-color:rgba(0,229,255,.18);box-shadow:none;opacity:.6}
+/* The two view utilities (theme, help) sit apart from the action buttons. */
+.hgroup{display:flex;align-items:center;gap:6px;padding-left:12px;margin-left:2px;border-left:1px solid var(--border)}
+/* The Tools menu is where the secondary actions live, so the one piece of
+   state that matters on its own — automatic make is off — rides on the
+   button and stays visible with the menu closed. */
+.dot{width:7px;height:7px;border-radius:50%;background:var(--danger);flex:none}
 .menu-wrap{position:relative}
-.menu{position:absolute;right:0;top:calc(100% + 6px);min-width:190px;display:flex;flex-direction:column;gap:2px;padding:6px;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);z-index:40}
+.menu{position:absolute;right:0;top:calc(100% + 6px);min-width:238px;max-width:min(340px,calc(100vw - 16px));max-height:calc(100vh - 12px);overflow:auto;display:flex;flex-direction:column;gap:2px;padding:6px;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);z-index:40}
 .menu[hidden]{display:none}
+.menu-label{font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);padding:8px 12px 3px}
+.menu-sep{height:1px;background:var(--border);margin:5px 6px}
 .menu-item{font:inherit;font-weight:500;text-align:left;color:var(--text);background:transparent;border:0;border-radius:7px;padding:9px 12px;cursor:pointer;display:flex;align-items:center;gap:9px;white-space:nowrap}
-.menu-item:hover{background:var(--hover)}
+.menu-item:hover,.menu-item:focus-visible{background:var(--hover)}
+.menu-item:focus-visible{outline:2px solid var(--primary);outline-offset:-2px}
+/* role="menuitemcheckbox" items spell their own state out on the right. */
+.menu-item[aria-checked="false"]{color:var(--muted)}
 .menu-item .icon{font-size:16px}
+.menu-item .state{margin-left:auto;padding-left:16px;font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--primary)}
+.menu-item[aria-checked="false"] .state{color:var(--muted)}
 main{position:relative;z-index:1;padding:18px}
 .meta{color:var(--muted);font-size:12px;margin:0 2px 10px}
 .list-wrap{position:relative;isolation:isolate;overflow:hidden;border-radius:var(--radius);background:var(--panel);border:1px solid var(--border);box-shadow:var(--shadow)}
@@ -2366,6 +3864,24 @@ textarea.cmdin{min-height:120px;resize:vertical;white-space:pre;overflow:auto}
 .linkto{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 .badge-broken{color:#b45309;font-size:11px;font-weight:700;letter-spacing:.4px}
 html[data-theme="dark"] .badge-broken{color:#ffc861}
+/* WebDAV lock marker in the name column and the folder meta line */
+.badge-lock{color:#b45309;font-size:11px;font-weight:700;letter-spacing:.4px}
+html[data-theme="dark"] .badge-lock{color:#ffc861}
+.linkbtn{border:none;background:none;padding:0;cursor:pointer;font:inherit;font-size:12px;color:var(--primary);text-decoration:underline}
+/* Help popup: a document, so it reads like one */
+.help{font-size:13px;line-height:1.55;max-width:76ch}
+.help h3{font-size:13px;margin:20px 0 6px;color:var(--primary)}
+.help h3:first-child{margin-top:0}
+.help p{margin:0 0 8px}
+.help ul{margin:0 0 8px;padding-left:20px}
+.help li{margin:2px 0}
+.help code,.help kbd{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--input-bg);border:1px solid var(--border);border-radius:4px;padding:1px 5px}
+.help pre{margin:0 0 10px;padding:11px 13px;background:var(--runout-bg);color:#e5e7eb;border-radius:8px;overflow-x:auto;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+.help pre code{background:none;border:0;padding:0;color:inherit}
+.help .keys{display:flex;flex-wrap:wrap;gap:6px 14px;margin:0 0 8px;color:var(--muted);font-size:12px}
+.help .legend{display:flex;flex-wrap:wrap;gap:4px 16px;margin:0 0 8px}
+.help .legend span{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.help .muted{color:var(--muted)}
 /* Drag-and-drop upload overlay */
 .drop{position:fixed;inset:0;z-index:45;display:flex;align-items:center;justify-content:center;pointer-events:none;background:rgba(63,125,74,.13);box-shadow:inset 0 0 0 4px var(--primary)}
 html[data-theme="dark"] .drop{background:rgba(0,229,255,.09)}
@@ -2653,6 +4169,8 @@ html[data-theme="dark"] .thumb{border-radius:2px}
 html[data-theme="dark"] .bar{border-color:rgba(0,229,255,.30);border-radius:2px}
 html[data-theme="dark"] .bar-fill{background:linear-gradient(90deg,#00a8c8,#00e5ff);box-shadow:0 0 12px rgba(0,229,255,.8)}
 html[data-theme="dark"] #themeBtn{color:var(--primary);font-size:18px;text-shadow:0 0 8px rgba(0,229,255,.9),0 0 20px rgba(0,229,255,.5)}
+html[data-theme="dark"] .dot{box-shadow:0 0 8px rgba(255,45,120,.8)}
+html[data-theme="dark"] .hgroup{border-left-color:rgba(0,229,255,.28)}
 html[data-theme="dark"] *{scrollbar-color:rgba(0,229,255,.55) rgba(1,8,12,.7)}
 html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
 @media(max-width:640px){.hide-sm{display:none}main{padding:12px}.name{max-width:55vw}}
@@ -2719,20 +4237,33 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
   <nav class="crumbs" id="crumbs"></nav>
   <div class="spacer"></div>
   <input class="filter" id="filter" type="search" placeholder="Filter this folder" aria-label="Filter this folder" autocomplete="off" spellcheck="false">
-  <button class="btn" id="themeBtn" type="button" title="Toggle light / dark theme" aria-label="Toggle light / dark theme">☼</button>
-  <button class="btn" id="makeBtn" type="button" aria-pressed="true" title="Run make automatically after edits, uploads and deletes"><span class="emoji">⚙</span> <span id="makeLabel">Auto-make: on</span></button>
-  <button class="btn" id="makeRunBtn" type="button" title="Run make in the current folder"><span class="emoji">🔨</span> Make</button>
-  <button class="btn" id="shellBtn" title="Run a bash command"><span class="emoji">🖥</span> Shell</button>
-  <button class="btn" id="zipBtn" title="Download the current folder as a zip file"><span class="emoji">📦</span> Zip</button>
-  <div class="menu-wrap">
-    <button class="btn" id="newBtn" aria-haspopup="true" aria-expanded="false" title="Create something new">+ New ▾</button>
+  <div class="menu-wrap" id="newWrap">
+    <button class="btn" id="newBtn" type="button" aria-haspopup="menu" aria-controls="newMenu" aria-expanded="false" title="Create a folder or a text file (press n)">+ New ▾</button>
     <div class="menu" id="newMenu" role="menu" hidden>
-      <button class="menu-item" id="newDir" role="menuitem"><span class="icon">📁</span>New folder</button>
-      <button class="menu-item" id="newFile" role="menuitem"><span class="icon">📄</span>New text file</button>
+      <button class="menu-item" id="newDir" role="menuitem" tabindex="-1"><span class="icon">📁</span>New folder</button>
+      <button class="menu-item" id="newFile" role="menuitem" tabindex="-1"><span class="icon">📄</span>New text file</button>
     </div>
   </div>
-  <label class="btn btn-primary" id="uploadBtn" title="Upload files into the current folder">Upload<input type="file" id="files" multiple hidden></label>
-  <label class="btn" id="upload64Btn" title="Upload as base64 (workaround for network problems)">Upload b64<input type="file" id="files64" multiple hidden></label>
+  <button class="btn btn-primary" id="uploadBtn" type="button" title="Upload files into the current folder (press u)">Upload</button>
+  <div class="menu-wrap">
+    <button class="btn" id="toolsBtn" type="button" aria-haspopup="menu" aria-controls="toolsMenu" aria-expanded="false" title="Zip download, base64 transfer, make and shell"><span class="emoji">⚙</span> Tools ▾<span class="dot" id="toolsDot" hidden title="Automatic make is off"></span></button>
+    <div class="menu" id="toolsMenu" role="menu" hidden>
+      <div class="menu-label">This folder</div>
+      <button class="menu-item" id="zipBtn" role="menuitem" tabindex="-1" title="Download the current folder as a zip file"><span class="icon">📦</span>Download folder as zip</button>
+      <button class="menu-item" id="upload64Btn" role="menuitem" tabindex="-1" title="Upload as base64 inside JSON: a workaround for a network that mangles binary uploads"><span class="icon">🔣</span>Upload as base64</button>
+      <div class="menu-sep" data-grp="run"></div>
+      <div class="menu-label" data-grp="run">Build and run</div>
+      <button class="menu-item" id="makeRunBtn" role="menuitem" tabindex="-1" title="Run make in the current folder"><span class="icon">🔨</span>Run make here</button>
+      <button class="menu-item" id="makeBtn" role="menuitemcheckbox" aria-checked="true" tabindex="-1" title="make runs automatically after edits, uploads and deletes (choose to disable it)"><span class="icon">🔁</span>Auto-make after edits<span class="state" id="makeLabel">on</span></button>
+      <button class="menu-item" id="shellBtn" role="menuitem" tabindex="-1" title="Run a bash command on the server"><span class="icon">🖥</span>Shell</button>
+    </div>
+  </div>
+  <div class="hgroup">
+    <button class="btn" id="themeBtn" type="button" title="Toggle light / dark theme" aria-label="Toggle light / dark theme">☼</button>
+    <button class="btn" id="helpBtn" type="button" title="Help: what everything here does, and how to mount this folder with WebDAV" aria-label="Help">?</button>
+  </div>
+  <input type="file" id="files" multiple hidden>
+  <input type="file" id="files64" multiple hidden>
 </header>
 <main>
   <div class="meta" id="meta"></div>
@@ -2770,8 +4301,10 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
 
 <script>
 const ROOT_NAME = __ROOT_NAME__;
-const FEATURES = __FEATURES__;  // {shell, run, make, b64, write} — set by the server at startup
+const FEATURES = __FEATURES__;  // {shell, run, make, b64, write, dav} — set by the server at startup
 const MAKE_POLL_MS = __MAKE_POLL_MS__;  // how often a background make job is polled
+const DAV_MOUNT = __DAV_MOUNT__;  // "/dav/" when the WebDAV share is on, "" when off
+const LIMITS = __DAV_LIMITS__;  // the tuning values the Help popup quotes
 const $ = s => document.querySelector(s);
 const rows = $("#rows"), crumbs = $("#crumbs");
 
@@ -2796,7 +4329,7 @@ const rows = $("#rows"), crumbs = $("#crumbs");
 }
 const state = { path: "", parent: null, entries: [], sizes: {}, sizesLoaded: false,
                 sort: { key: "name", dir: 1 }, total: 0, truncated: false,
-                filter: "", sel: new Set() };
+                filter: "", sel: new Set(), locked: false, lockOwner: null };
 let dirty = false;      // editor has unsaved changes (see beforeunload)
 let uploadBusy = false; // an upload is running (see beforeunload)
 
@@ -2887,6 +4420,7 @@ function load(path){
     if(seq!==loadSeq) return;  // superseded by a newer click
     state.entries=d.entries; state.parent=d.parent;
     state.total=d.total; state.truncated=!!d.truncated;
+    state.locked=!!d.locked; state.lockOwner=d.lock_owner||null;
     document.title = (state.path? state.path+"/" : "") + ROOT_NAME + " · Files";
     render();
     loadFolderSizes(seq);
@@ -2926,9 +4460,20 @@ function render(){
     // The server capped the listing; say so instead of implying this is all.
     meta += " · showing the first "+state.entries.length+" of "+state.total+" entries";
   } else if(state.filter){
-    meta += " · "+shown.length+" of "+state.entries.length+" match “"+state.filter+"”";
+    meta += " · "+shown.length+" of "+state.entries.length+" match “"+esc(state.filter)+"”";
   }
-  $("#meta").textContent = meta;
+  // A lock on this folder covers everything inside it, so say so once here
+  // instead of letting every write fail on its own.
+  if(state.locked){
+    meta += ' · <span class="badge-lock">🔒 locked over WebDAV'
+      + (state.lockOwner ? " by "+esc(state.lockOwner) : "")+"</span>"
+      + ' <button class="linkbtn" id="unlockHere">Unlock</button>';
+  }
+  $("#meta").innerHTML = meta;
+  const unlockHere=$("#unlockHere");
+  if(unlockHere){
+    unlockHere.onclick=()=>unlockEntry({ name: state.path || ROOT_NAME, path: state.path });
+  }
   $("#empty").hidden = shown.length>0 || !state.entries.length;
   $("#empty").textContent = state.entries.length
     ? "Nothing here matches “"+state.filter+"”."
@@ -3013,8 +4558,15 @@ function iconHTML(e){
 // the link that delete/rename/move act on, not its target.
 function markHTML(e){
   if(e.broken) return ' <span class="badge-broken" title="This symbolic link points at nothing">broken</span>';
+  if(e.locked) return ' <span class="badge-lock" title="'+esc(lockTip(e))+'">🔒 locked</span>';
   if(e.link) return ' <span class="linkto" title="Symbolic link to '+esc(e.link)+'">↗ '+esc(e.link)+'</span>';
   return "";
+}
+
+function lockTip(e){
+  return "Locked over WebDAV"+(e.lock_owner ? " by "+e.lock_owner : "")
+    +": a client that has this folder mounted is writing to it. "
+    + "Close the file there, or unlock it here.";
 }
 
 function sizeCell(e){
@@ -3024,27 +4576,48 @@ function sizeCell(e){
   return fmtSize(e.size);
 }
 
+// Every row action in one table, because the buttons in the listing and the
+// legend in the Help popup have to agree; the popup prints this table.
+const ACT = {
+  open:    ["📂", "Open this folder"],
+  zip:     ["📦", "Download this folder as a zip file"],
+  rename:  ["✏️", "Rename"],
+  move:    ["🚚", "Move to another folder"],
+  copy:    ["📋", "Copy to another folder"],
+  extract: ["🗜️", "Extract this zip archive into the folder"],
+  run:     ["▶", "Run this executable"],
+  view:    ["👁", "Open in the viewer"],
+  edit:    ["✎", "Open in the editor"],
+  dl:      ["⬇", "Download the file"],
+  dlb64:   ["🔣", "Transfer as base64 (a workaround for a flaky network)"],
+  unlock:  ["🔓", "Break the WebDAV lock on this entry"],
+  del:     ["🗑", "Delete"],
+};
+
+function act(id, title){
+  const [icon, hint] = ACT[id];
+  return '<button class="act" data-id="'+id+'" title="'+esc(title || hint)+'">'+icon+'</button>';
+}
+
 function actionsHTML(e){
   let h="";
   if(e.kind==="dir"){
-    h+='<button class="act" data-id="open" title="Open folder">📂</button>';
-    h+='<button class="act" data-id="zip" title="Download as zip">📦</button>';
+    h+=act("open")+act("zip");
   }
   if(FEATURES.write){
-    h+='<button class="act" data-id="rename" title="Rename">✏️</button>';
-    h+='<button class="act" data-id="move" title="Move to…">🚚</button>';
-    h+='<button class="act" data-id="copy" title="Copy to…">📋</button>';
+    h+=act("rename")+act("move")+act("copy");
   }
   if(e.kind!=="dir"){
-    if(FEATURES.write && e.name.toLowerCase().endsWith(".zip")) h+='<button class="act" data-id="extract" title="Extract zip">🗜️</button>';
-    if(e.run) h+='<button class="act" data-id="run" title="Run">▶</button>';
-    const vi = e.kind==="text" ? "✎" : "👁";
-    const vt = e.kind==="text" ? "Edit" : "View";
-    h+='<button class="act" data-id="view" title="'+vt+'">'+vi+'</button>';
-    h+='<button class="act" data-id="dl" title="Download">⬇</button>';
-    if(FEATURES.b64) h+='<button class="act" data-id="dlb64" title="Download as base64 (workaround for network problems)">🔣</button>';
+    if(FEATURES.write && e.name.toLowerCase().endsWith(".zip")) h+=act("extract");
+    if(e.run) h+=act("run");
+    h+=act(e.kind==="text" ? "edit" : "view");
+    h+=act("dl");
+    if(FEATURES.b64) h+=act("dlb64", "Download as base64 (workaround for network problems)");
   }
-  if(FEATURES.write) h+='<button class="act" data-id="del" title="Delete">🗑</button>';
+  // A lock held through the mount: unlocking is the only way to keep working
+  // here without hunting down whichever editor has the file open.
+  if(FEATURES.dav && FEATURES.write && e.locked) h+=act("unlock", lockTip(e));
+  if(FEATURES.write) h+=act("del");
   return h;
 }
 
@@ -3071,7 +4644,10 @@ function trEntry(e){
   });
   return tr;
 }
-const ACTION_MAP={ open:e=>load(e.path), view:e=>openFile(e), dl:e=>download(e), del:e=>del(e), rename:e=>renameItem(e), move:e=>moveItem(e), copy:e=>copyItem(e), extract:e=>extractZip(e), zip:e=>zipDir(e.path), dlb64:e=>downloadB64(e), run:e=>runFile(e) };
+const ACTION_MAP={ open:e=>load(e.path), view:e=>openFile(e), edit:e=>openFile(e),
+  dl:e=>download(e), del:e=>del(e), rename:e=>renameItem(e), move:e=>moveItem(e),
+  copy:e=>copyItem(e), extract:e=>extractZip(e), zip:e=>zipDir(e.path),
+  dlb64:e=>downloadB64(e), run:e=>runFile(e), unlock:e=>unlockEntry(e) };
 
 // -- multi-select ------------------------------------------------------------
 function setSel(path, on, tr){
@@ -3250,6 +4826,22 @@ function del(e){
 
 function download(e){ window.location = "api/download?path="+encodeURIComponent(e.path); }
 
+// Unlocking is recovery, not a permission: it is here so a mount whose client
+// died (or a laptop that walked away with the file open) does not lock the
+// entry for the whole timeout. The client on the mount finds out on its next
+// write, which is exactly what it is built to handle.
+function unlockEntry(e){
+  if(!confirm('Break the WebDAV lock on "'+e.name+'"?'+
+      '\n\nWhatever has the file open through the mount will lose its lock and '
+      +'may have to reload the file.')) return;
+  api("api/unlock?path="+encodeURIComponent(e.path), {method:"POST"})
+    .then(d=>{
+      toast(d.unlocked ? "Unlocked "+e.name : e.name+" was already unlocked");
+      load(state.path);
+    })
+    .catch(err=>toast(err.message, true));
+}
+
 function zipDir(path){
   toast("Preparing zip…");
   window.location = "api/zip?path="+encodeURIComponent(path||"");
@@ -3257,20 +4849,82 @@ function zipDir(path){
 $("#zipBtn").onclick=()=>zipDir(state.path);
 
 // -- Download as base64 (workaround: JSON transport instead of binary stream)
+// The answer is read as a stream rather than with r.json(): at the top of the
+// transfer limit the document is 1.4 GB of base64, and JSON.parse of that asks
+// the browser for several gigabytes at once. It is turned back into bytes in
+// whole groups of four characters as it arrives, so only one network chunk of
+// it is held as text and the peak is the file itself.
+function b64ToBytes(group){
+  const bin=atob(group), out=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
+  return out;
+}
+
+async function receiveB64(e){
+  const r=await fetch("api/download64?path="+encodeURIComponent(e.path));
+  if(!r.ok){
+    let msg=r.status+" "+r.statusText;
+    try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(err){}
+    throw new Error(msg);
+  }
+  if(!r.body || !r.body.getReader) throw new Error("This browser cannot stream the answer");
+  const utf8=new TextDecoder(), reader=r.body.getReader();
+  let text="", undecoded="", meta=null, parts=[], bytes=0, ended=false;
+  const paint=()=>{
+    const fill=$("#barFill64");
+    if(fill) fill.style.width=(meta.size?Math.min(100, 100*bytes/meta.size):100).toFixed(1)+"%";
+    const cnt=$("#upCount64");
+    if(cnt) cnt.textContent=fmtSize(bytes)+" of "+fmtSize(meta.size)+" (base64 in JSON)";
+  };
+  while(!ended){
+    const got=await reader.read();
+    ended=got.done;
+    text += utf8.decode(got.value || new Uint8Array(), {stream:!ended});
+    if(!meta){
+      const at=text.indexOf(',"data":"');
+      if(at<0){
+        if(ended) throw new Error("Unexpected answer from the server");
+        continue;  // the {"path":…,"size":…} header is not complete yet
+      }
+      try{ meta=JSON.parse(text.slice(0,at)+"}"); }   // the header ends with the size
+      catch(err){ throw new Error("Unexpected answer from the server"); }
+      text=text.slice(at+9);
+      openModal("Downloading — "+meta.name,
+        '<div class="up-name">'+esc(meta.name)+' · base64</div>'+
+        '<div class="bar"><div class="bar-fill" id="barFill64"></div></div>'+
+        '<div class="up-count" id="upCount64"></div>');
+    }
+    undecoded += text; text="";
+    // Two characters are always held back: the document closes with `"}` and
+    // that must not be taken for base64. What is decoded is a whole number of
+    // groups of four, so a group never spans two flushes.
+    let take=undecoded.length-2;
+    if(take>0){
+      take -= take%4;
+      if(take>0){
+        const part=b64ToBytes(undecoded.slice(0,take));
+        parts.push(part); bytes+=part.length; undecoded=undecoded.slice(take);
+        paint();
+      }
+    }
+  }
+  if(!meta) throw new Error("Unexpected answer from the server");
+  if(!undecoded.endsWith('"}')) throw new Error("The transfer stopped early");
+  if(bytes!==meta.size) throw new Error("The transfer stopped early");
+  return {name: meta.name, blob:new Blob(parts, {type:"application/octet-stream"})};
+}
+
 function downloadB64(e){
-  toast("Encoding "+e.name+" as base64…");
-  api("api/download64?path="+encodeURIComponent(e.path)).then(d=>{
-    const bin=atob(d.data);
-    const bytes=new Uint8Array(bin.length);
-    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
-    const blob=new Blob([bytes], {type:"application/octet-stream"});
+  toast("Downloading "+e.name+" as base64…");
+  receiveB64(e).then(({name, blob})=>{
     const url=URL.createObjectURL(blob);
     const a=document.createElement("a");
-    a.href=url; a.download=d.name;
+    a.href=url; a.download=name;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(url), 10000);
-    toast("Downloaded "+d.name);
-  }).catch(err=>toast(err.message, true));
+    closeModal(true);
+    toast("Downloaded "+name+" ("+fmtSize(blob.size)+" of base64)");
+  }).catch(err=>{ closeModal(true); toast(err.message, true); });
 }
 
 // -- Extract zip -------------------------------------------------------------
@@ -3408,7 +5062,7 @@ function runFile(e){
   $("#runGo").onclick=doRun;
 }
 
-// -- Shell (header button): run a bash command ------------------------------
+// -- Shell (Tools menu): run a bash command ---------------------------------
 let shellHistory=[];
 let shellHistIdx=-1;
 function openShell(){
@@ -3446,7 +5100,7 @@ function openShell(){
 }
 $("#shellBtn").onclick=openShell;
 
-// -- Make (header button): run make in the current folder on demand ---------
+// -- Make (Tools menu): run make in the current folder on demand ------------
 function runMake(){
   const where = state.path || ROOT_NAME;
   openModal("make — "+where,
@@ -3598,22 +5252,80 @@ function transfer(kind, e, dest){
     .catch(err=>toast(err.message, true));
 }
 
-// -- header "New" dropdown --------------------------------------------------
-const newBtn=$("#newBtn"), newMenu=$("#newMenu");
-function closeNewMenu(){ newMenu.hidden=true; newBtn.setAttribute("aria-expanded","false"); }
-newBtn.onclick=ev=>{
-  ev.stopPropagation();
-  const open=newMenu.hidden;
-  newMenu.hidden=!open;
-  newBtn.setAttribute("aria-expanded", String(open));
-};
+// -- header dropdowns: "+ New" and "Tools" ----------------------------------
+// Both menus behave alike: the button toggles one, opening it closes the
+// other, and Escape or a click anywhere else closes them. Arrow keys walk the
+// items, and choosing one closes the menu before its action runs, so a menu is
+// never left hanging over the dialog it just opened. Only a checkbox item
+// stays open, because its on/off label is the feedback for that click.
+const MENUS = [];
+function closeMenus(){
+  MENUS.forEach(m=>{ m.menu.hidden=true; m.btn.setAttribute("aria-expanded","false"); });
+}
+function setupMenu(btnSel, menuSel){
+  const btn=$(btnSel), menu=$(menuSel);
+  if(!btn || !menu) return;
+  // Items the feature flags removed are not in the tab order either.
+  const items=()=>[...menu.querySelectorAll(".menu-item")].filter(el=>el.style.display!=="none");
+  const focusAt=i=>{ const list=items(); if(list.length) list[((i%list.length)+list.length)%list.length].focus(); };
+  const close=()=>{ menu.hidden=true; btn.setAttribute("aria-expanded","false"); };
+  // A menu hangs from its button's right edge, which on a narrow (wrapped)
+  // header puts it partly off screen, so nudge it back inside the viewport.
+  // It stays absolutely positioned on purpose: the header's backdrop-filter
+  // would make it the containing block of a fixed element anyway.
+  const place=()=>{
+    menu.style.right="0px";
+    const r=menu.getBoundingClientRect();
+    const shift=Math.max(0, r.right-(innerWidth-8)) - Math.max(0, 8-r.left);
+    if(shift) menu.style.right=shift+"px";
+  };
+  const open=()=>{
+    closeMenus();
+    menu.hidden=false;
+    btn.setAttribute("aria-expanded","true");
+    place();
+    focusAt(0);
+  };
+  btn.onclick=ev=>{ ev.stopPropagation(); if(menu.hidden) open(); else close(); };
+  btn.onkeydown=ev=>{ if(ev.key==="ArrowDown"){ ev.preventDefault(); open(); } };
+  menu.addEventListener("click", ev=>{
+    const item = ev.target.closest(".menu-item");
+    if(!item) return;
+    // Ticking a checkbox item leaves the menu open: that is where its on/off
+    // label is, and closing it would hide the result of the click.
+    if(item.getAttribute("role") === "menuitemcheckbox") return;
+    close();
+  });
+  menu.addEventListener("keydown", ev=>{
+    const at=items().indexOf(document.activeElement);
+    if(ev.key==="ArrowDown"){ ev.preventDefault(); focusAt(at+1); }
+    else if(ev.key==="ArrowUp"){ ev.preventDefault(); focusAt(at-1); }
+    else if(ev.key==="Home"){ ev.preventDefault(); focusAt(0); }
+    else if(ev.key==="End"){ ev.preventDefault(); focusAt(-1); }
+    else if(ev.key==="Tab"){ close(); }
+    else if(ev.key==="Escape"){ ev.preventDefault(); close(); btn.focus(); }
+  });
+  MENUS.push({btn, menu, open, close});
+}
+setupMenu("#newBtn", "#newMenu");
+setupMenu("#toolsBtn", "#toolsMenu");
 document.addEventListener("click", ev=>{
-  if(!newMenu.hidden && !ev.target.closest(".menu-wrap")) closeNewMenu();
+  if(!ev.target || !ev.target.closest(".menu-wrap")) closeMenus();
 });
-document.addEventListener("keydown", ev=>{ if(ev.key==="Escape") closeNewMenu(); });
+document.addEventListener("keydown", ev=>{ if(ev.key==="Escape") closeMenus(); });
+// Resizing or rotating a device moves the buttons out from under an open menu.
+window.addEventListener("resize", closeMenus);
+// Opens a menu by the button's id, for the keyboard shortcuts below; false
+// when the menu was removed along with the features it holds (offsetParent is
+// null for a hidden button and for one inside a hidden group).
+function openMenu(btnSel){
+  const m=MENUS.find(x=>x.btn.matches(btnSel));
+  if(!m || m.btn.offsetParent === null) return false;
+  m.open();
+  return true;
+}
 
 $("#newDir").onclick=()=>{
-  closeNewMenu();
   openModal("New folder",
     '<div class="field"><label>Folder name</label><input id="dirName" placeholder="my-new-folder" autocomplete="off"></div>'+
     '<div class="modal-actions"><button class="btn btn-primary" id="mkOk">Create</button><button class="btn" onclick="closeModal()">Cancel</button></div>');
@@ -3631,7 +5343,6 @@ function doMkdir(inp){
 }
 
 $("#newFile").onclick=()=>{
-  closeNewMenu();
   openModal("New text file",
     '<div class="field"><label>File name</label><input id="fileName" value="untitled.txt" placeholder="untitled.txt" autocomplete="off" spellcheck="false"></div>'+
     '<div class="modal-actions"><button class="btn btn-primary" id="nfOk">Create</button><button class="btn" onclick="closeModal()">Cancel</button></div>');
@@ -3656,7 +5367,13 @@ function doNewFile(inp){
 
 // -- Uploads -----------------------------------------------------------------
 const UPLOAD_PARALLEL = 3;  // uploads in flight at once
+// Both pickers are hidden inputs in the header rather than inside the buttons
+// that open them, so a menu item can close its menu and still reach the file
+// dialog.
+$("#uploadBtn").onclick=()=>$("#files").click();
+$("#upload64Btn").onclick=()=>$("#files64").click();
 $("#files").addEventListener("change", function(){
+  closeMenus();
   const files=[...this.files]; this.value="";
   if(files.length) uploadAll(files);
 });
@@ -3758,17 +5475,57 @@ document.addEventListener("drop", e=>{
 });
 // -- Upload as base64 (workaround: encode in the browser, JSON over the wire)
 $("#files64").addEventListener("change", function(){
+  closeMenus();
   const files=[...this.files]; this.value="";
   if(files.length) uploadB64All(files, 0, [], state.path);
 });
-function readB64(file){
-  return new Promise((resolve,reject)=>{
-    const fr=new FileReader();
-    fr.onload=()=>{ const s=String(fr.result); resolve(s.slice(s.indexOf(",")+1)); };
-    fr.onerror=()=>reject(new Error("Could not read file"));
-    fr.readAsDataURL(file);
+const B64_SLICE = 3 * 1024 * 1024;  // file bytes per read: a multiple of 3, so
+                                    // each slice encodes without padding and
+                                    // the pieces join into one payload
+// Encoded in slices rather than in one FileReader pass, and sent as a Blob:
+// a 1 GB file becomes a 1.4 GB base64 string, and JSON.stringify around it
+// would want a second one on top of that (a browser refuses a string that
+// long anyway). Each slice goes straight into a Blob part, which lets the
+// string it came from go, and a Blob is uploaded straight from its parts —
+// and the browser can report real byte progress while it goes up.
+function readB64Parts(file){
+  const parts=[];
+  let at=0;
+  const step=()=>{
+    if(at>=file.size) return Promise.resolve(parts);
+    return new Promise((resolve,reject)=>{
+      const fr=new FileReader();
+      fr.onload=()=>{ const s=String(fr.result); parts.push(new Blob([s.slice(s.indexOf(",")+1)])); resolve(); };
+      fr.onerror=()=>reject(new Error("Could not read the file"));
+      fr.readAsDataURL(file.slice(at, Math.min(at+B64_SLICE, file.size)));
+    }).then(()=>{ at+=B64_SLICE; return step(); });
+  };
+  return step();
+}
+
+function uploadB64One(file, target, onProgress){
+  return readB64Parts(file).then(parts=>{
+    const body=new Blob(['{"data":"'].concat(parts,['"}']), {type:"application/json"});
+    return new Promise((resolve,reject)=>{
+      const xhr=new XMLHttpRequest();
+      xhr.open("POST","api/upload64?path="+encodeURIComponent(target||"")+"&filename="+encodeURIComponent(file.name));
+      xhr.responseType="text";
+      xhr.setRequestHeader("Content-Type","application/json");
+      if(!autoMakeEnabled) xhr.setRequestHeader("X-FM-Auto-Make","0");
+      if(onProgress && xhr.upload){
+        xhr.upload.onprogress=e=>{ if(e.lengthComputable) onProgress(e.loaded); };
+      }
+      xhr.onload=()=>{
+        let d=null; try{ d=JSON.parse(xhr.responseText); }catch(e){}
+        if(xhr.status>=200 && xhr.status<300) resolve(d||{});
+        else reject(new Error((d&&d.error)||(xhr.status+" "+xhr.statusText)));
+      };
+      xhr.onerror=()=>reject(new Error("Network error"));
+      xhr.send(body);
+    });
   });
 }
+
 function uploadB64All(files, i, makeRuns, target){
   if(!makeRuns) makeRuns=[];
   if(i>=files.length){
@@ -3780,14 +5537,21 @@ function uploadB64All(files, i, makeRuns, target){
   }
   const f=files[i];
   uploadBusy = true;
+  // Four characters per three bytes of file, plus the JSON around them.
+  const total=Math.ceil(f.size/3)*4+12;
   openModal("Uploading to "+folderLabel(target)+" (base64)…",
     '<div class="up-name">'+esc(f.name)+'</div>'+
     '<div class="bar"><div class="bar-fill" id="barFill64"></div></div>'+
-    '<div class="up-count">'+(i+1)+' / '+files.length+'</div>');
-  const fill=$("#barFill64"); if(fill) fill.style.width="100%";  // no byte progress: the file is fully read first
-  readB64(f)
-    .then(b64=>api("api/upload64?path="+encodeURIComponent(target||"")+"&filename="+encodeURIComponent(f.name),
-        { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ data: b64 }) }))
+    '<div class="up-count" id="upCount64"></div>');
+  const paint=(sent, phase)=>{
+    const fill=$("#barFill64");
+    if(fill) fill.style.width=(total?Math.min(100,100*sent/total):100).toFixed(1)+"%";
+    const cnt=$("#upCount64");
+    if(cnt) cnt.textContent=(i+1)+" / "+files.length+" · "+fmtSize(sent)+" of "+
+      fmtSize(total)+(phase?" · "+phase:"");
+  };
+  paint(0, "encoding to base64…");   // reading the file comes first
+  uploadB64One(f, target, sent=>paint(sent))
     .then(r=>{ if(r.make) makeRuns.push({file:r.name, job:r.make.job}); uploadB64All(files, i+1, makeRuns, target); })
     .catch(err=>{ toast(f.name+": "+err.message, true); setTimeout(()=>uploadB64All(files, i+1, makeRuns, target), 500); });
 }
@@ -3904,14 +5668,18 @@ if(themeMq){
 window.addEventListener("storage", e => { if(e.key === THEME_KEY) applyTheme(); });
 
 // -- Auto-make toggle: skip `make` after edits/uploads/deletes -------------
+// The toggle lives in the Tools menu now, so its state would be out of sight
+// when the menu is closed: the dot on the Tools button is what says "rebuilds
+// are not happening" without opening anything.
 function applyMakeState(){
-  const btn = $("#makeBtn"), label = $("#makeLabel");
+  const btn = $("#makeBtn"), label = $("#makeLabel"), dot = $("#toolsDot");
   if(!btn) return;
-  btn.setAttribute("aria-pressed", autoMakeEnabled ? "true" : "false");
-  if(label) label.textContent = "Auto-make: " + (autoMakeEnabled ? "on" : "off");
+  btn.setAttribute("aria-checked", autoMakeEnabled ? "true" : "false");
+  if(label) label.textContent = autoMakeEnabled ? "on" : "off";
   btn.title = autoMakeEnabled
-    ? "make runs automatically after edits, uploads and deletes (click to disable)"
-    : "Automatic make is off (click to enable)";
+    ? "make runs automatically after edits, uploads and deletes (choose to disable it)"
+    : "Automatic make is off (choose to enable it)";
+  if(dot) dot.hidden = autoMakeEnabled || !FEATURES.make || !FEATURES.write;
 }
 $("#makeBtn").onclick = () => {
   autoMakeEnabled = !autoMakeEnabled;
@@ -3923,18 +5691,259 @@ window.addEventListener("storage", e => {
   if(e.key === MAKE_KEY){ autoMakeEnabled = storedAutoMake(); applyMakeState(); }
 });
 
+// -- Help -------------------------------------------------------------------
+// The documentation lives in the page it describes: nothing to keep in sync
+// with a README, and the parts the server was started without are left out
+// instead of being explained and then missing.
+function helpHTML(){
+  const url = location.origin + DAV_MOUNT;
+  const rows = [];
+  const add = (title, body) => rows.push('<h3>'+title+'</h3>'+body);
+
+  add("Browse", `
+    <ul>
+      <li>Click a folder to open it, a file to open it here. The path lives in the
+        URL, so the back button, a reload and a pasted link all land on the same
+        folder.</li>
+      <li><b>Filter</b> narrows the listing as you type (Esc clears it). Every column
+        header sorts; folders always stay together, and dates sort newest first.</li>
+      <li>Folder sizes are counted on demand and cached for a moment, so a big tree
+        does not slow the listing down. A symlink is shown as the entry it is:
+        renaming, moving and deleting act on the link, not on what it points at.</li>
+      <li>Tick the boxes on the left (or the box in the header) to act on a whole
+        set of entries at once.</li>
+    </ul>`);
+
+  add("Create, upload, download", `
+    <ul>
+      <li>The header keeps the two everyday actions in plain sight — <b>+ New</b>
+        (a folder or an empty text file) and <b>Upload</b> — and everything else is
+        under <b>⚙ Tools</b>. Files can also be dropped anywhere onto the page.
+        A folder can be dropped only on the WebDAV mount: a browser cannot send a
+        whole tree in one request.</li>
+      <li><b>Tools ▸ Download folder as zip</b> zips the folder you are looking at,
+        recursively. A .zip file has an <b>Extract</b> action, which unpacks it next
+        to itself or into a folder you pick.</li>
+      <li><b>Download</b> is a plain streaming download that can be resumed.
+        ${FEATURES.b64 ? `<b>🔣</b> transfers the same file as base64 inside JSON, which
+        survives a proxy or VPN that mangles binary downloads; the reverse of it,
+        <b>Tools ▸ Upload as base64</b>, uploads a file the same way.`
+        : "Base64 transfer is disabled on this server."}</li>
+    </ul>`);
+
+  add("Editing text", `
+    <ul>
+      <li>A text file opens in the editor. <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>S</kbd>
+        saves; a dot in the title bar means there are unsaved changes, and closing or
+        navigating away asks before throwing them away.</li>
+      <li>The line ending is chosen per save, because a browser textarea always sends
+        plain <code>\\n</code>.</li>
+      <li>Saving refuses to overwrite a file that changed on the server since you
+        opened it, and files arrive complete or not at all: an upload that dies
+        half way leaves nothing behind.</li>
+    </ul>`);
+
+  if(FEATURES.make) add("Make", `
+    <ul>
+      <li>When the folder you are working in has a Makefile, saving, uploading or
+        deleting in it starts <code>make</code> there in the background, and the
+        result appears when the build finishes.</li>
+      <li><b>Tools ▸ Auto-make after edits</b> turns that off (kept in this browser,
+        not on the server); while it is off the <b>Tools</b> button carries a red dot
+        so it is not forgotten. <b>Tools ▸ Run make here</b> runs it right now and
+        waits for the output.</li>
+    </ul>`);
+
+  if(FEATURES.shell || FEATURES.run) add("Running things", `
+    <ul>
+      ${FEATURES.run ? "<li>An executable file has a <b>▶</b> action, which runs it and shows its output.</li>" : ""}
+      ${FEATURES.shell ? "<li><b>Tools ▸ Shell</b> runs a command in a box on the server and shows you the output. It is the same box the files are in, so <code>ls</code> sees exactly this folder.</li>" : ""}
+      <li>Everything the server runs is capped in time and in output size, so a
+        command that never ends cannot wedge it.</li>
+    </ul>`);
+
+  add("Actions in each row", `
+    <div class="legend">${Object.entries(ACT).map(([id, [icon, title]]) =>
+      '<span><span class="icon">'+icon+'</span>'+esc(title)+'</span>').join("")}</div>
+    <p class="muted">Disabled features simply do not appear, and in read-only mode
+      everything that changes something is gone.</p>`);
+
+  add("Keys", `
+    <div class="keys">
+      <span><kbd>?</kbd> this help</span>
+      <span><kbd>/</kbd> filter box</span>
+      <span><kbd>n</kbd> the + New menu</span>
+      <span><kbd>u</kbd> upload</span>
+      <span><kbd>↑</kbd><kbd>↓</kbd> inside an open menu</span>
+      <span><kbd>Esc</kbd> close, clear</span>
+      <span><kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>S</kbd> save</span>
+      <span><kbd>Enter</kbd> accept a prompt</span>
+    </div>
+    <p class="muted">The theme button switches between the daylight and night themes;
+      Shift-click it to follow your system setting again.</p>`);
+
+  if(FEATURES.dav) add("Mount this folder with WebDAV", `
+    <p>Every file and folder here is also a WebDAV share, at</p>
+    <pre><code>${esc(url)}</code></pre>
+    <p>so it can be mounted and used with ordinary programs. The client this is built
+      for is <b>davfs2</b> on Linux.</p>
+    <p>Mount it once:</p>
+    <pre><code>sudo mkdir -p /mnt/this
+sudo mount -t davfs ${esc(url.replace(/\/$/, ""))} /mnt/this</code></pre>
+    <p>Or keep it in <code>/etc/fstab</code> so your own user can mount and unmount it
+      without a password (<code>noauto</code> means it is not mounted at boot):</p>
+    <pre><code>${esc(url.replace(/\/$/, ""))} /mnt/this davfs noauto,user,_netdev 0 0</code></pre>
+    <pre><code>mount /mnt/this
+umount /mnt/this     # or: fusermount -u /mnt/this</code></pre>
+    <ul>
+      <li>Allow your user to mount WebDAV once: <code>sudo usermod -aG davfs2 $USER</code>,
+        then log out and in again. Distributions differ here — some rely on
+        <code>/usr/sbin/mount.davfs</code> being setuid root, which lets
+        <code>sudo mount -t davfs -o uid=$(id -u),gid=$(id -g) …</code> mount it.</li>
+      <li><b>davfs2 asks for credentials anyway.</b> This server never asks who you
+        are, but <code>mount.davfs</code> still prompts for a username and password
+        the first time it sees this URL: press Return twice, which is what an empty
+        answer means here. It reads <code>~/.davfs2/secrets</code> before asking, so
+        one line <code>${esc(url.replace(/\/$/, ""))} guest guest</code> in that file
+        (mode 600) keeps it quiet — and note that a mount done with <code>sudo</code>
+        reads <em>root's</em> copy of it. A proxy with authentication in front of this
+        server wants its credentials in the same place rather than in fstab.</li>
+      <li>If you reach this page through a proxy under a sub-path, mount that same
+        URL with <code>/dav</code> on the end — the address above is already built
+        from the address you are looking at.</li>
+      <li><code>--read-only</code> makes the mount refuse writes. To mount it read-only
+        from the client side anyway, use <code>-o ro</code>.</li>
+    </ul>`);
+
+  if(FEATURES.dav) add("Mounting it: how it behaves", `
+    <ul>
+      <li><b>Writes are late by design.</b> davfs2 keeps a changed file locally and
+        re-uploads the whole thing about ten seconds after the program closes it, so
+        the browser may show the old version for a moment. Put
+        <code>delay_upload 0</code> in <code>~/.davfs2/davfs2.conf</code> if you want
+        writes to go over at once.</li>
+      <li><b>Listings are cached too</b> (a minute by default), so a file the browser
+        just created may appear on the mount a little later. <code>dir_refresh 0</code>
+        turns that off if you would rather have it live.</li>
+      <li><b>A file open on the mount is locked</b>, and the browser will be told it
+        is busy instead of quietly overwriting it — the row says
+        <span class="badge-lock">🔒 locked</span> and has a 🔓 action to break the
+        lock if whoever has it open walked away. The other way round too: a file the
+        browser holds a lock on is refused on the mount, where that looks like
+        <i>Permission denied</i> on a write and an I/O error on a rename. Only
+        exclusive write locks exist here, and a lock that is never refreshed dies
+        after ${LIMITS.lockTtl/60} minutes, so a crashed program cannot block a file
+        forever. Reading is never refused, from either side.</li>
+      <li><b>A lost update is refused, not won.</b> Every file carries a strong ETag
+        and the server checks <code>If-Match</code>/<code>If-None-Match</code>, so an
+        upload of a stale version comes back as "the file changed since you read it"
+        rather than replacing what is there now.</li>
+      <li><b>Edit one file from both sides</b> and davfs2 gets the last word: it is
+        told its upload was stale, re-reads the file, then sends its own version and
+        leaves the copy it started from in <code>lost+found</code> on the mount — so
+        the browser's edit is overwritten, but nothing is thrown away. Breaking a
+        lock with 🔓 and then saving is what invites this. Here the guard is the
+        same in the other direction: saving a file that changed on disk since it was
+        opened is refused and asks you to reload it.</li>
+      <li><b>The executable bit does cross over.</b> A script made executable on the
+        mount can be run from the browser, and one made executable here is runnable
+        there. WebDAV has exactly one yes-or-no for that, so <code>chmod 700</code>
+        and <code>chmod 755</code> look the same on the other side.</li>
+      <li><b>Not carried over WebDAV:</b> symbolic links (davfs2 cannot express
+        them, so a link looks like an ordinary file whose contents are the name it
+        points at, and a link to a folder looks like the folder), owner and group,
+        empty folders on a read-only server, and partial writes into the middle of a
+        file (the whole file is always re-uploaded).</li>
+      <li>That listing and those file modes are what davfs2 <em>cached</em>, and its
+        cache survives an unmount (<code>~/.cache/davfs2</code>, or
+        <code>/var/cache/davfs2</code> when mounted as root). After changing files
+        outside the mount, it is the mount that is a minute behind — or delete that
+        cache directory.</li>
+      <li><code>lost+found</code> — and on some versions <code>.DAVFS</code> — exists
+        only inside the mount: davfs2's own bookkeeping, and its place for writes that
+        failed while the connection was down. This server never hears about them, so
+        the shared folder stays clean and this listing never shows them.</li>
+      <li>Edits and uploads that arrive through the mount start <code>make</code> in
+        that folder exactly as a browser edit does, only with nobody waiting for the
+        result.</li>
+      <li>A folder's WebDAV listing stops at ${LIMITS.davEntries} entries (the browser
+        listing stops at ${LIMITS.list}); a folder bigger than that is fine to use,
+        just not fully listed in one request.</li>
+    </ul>`);
+
+  add("Limits on this server", `
+    <ul>
+      <li>Files up to ${fmtSize(LIMITS.transfer)} go through on every path: upload,
+        download, zip download, WebDAV and the base64 workaround. All of them are
+        streamed, so a big file costs the server a chunk of memory rather than the
+        file itself; the limit that bites next is usually free disk.</li>
+      <li>The text editor loads files up to ${fmtSize(LIMITS.text)}; bigger ones are
+        download-only.</li>
+      <li>A JSON request body is capped at ${fmtSize(LIMITS.body)} and a base64 transfer
+        at ${fmtSize(LIMITS.b64)} — that upload arrives as a JSON body of up to
+        ${fmtSize(LIMITS.b64Body)}, because base64 is a third larger than the file.
+        Extracting a zip stops at ${fmtSize(LIMITS.zipEntry)} per entry and
+        ${fmtSize(LIMITS.zipTotal)} in total.</li>
+      <li>A command returns after ${LIMITS.runTimeout} seconds by default and never
+        later than ${LIMITS.runMax}.</li>
+      <li>An idle connection is closed after ${LIMITS.socket} seconds, which is what
+        a WebDAV client expects when a proxy keeps a socket open.</li>
+      <li>Behind a reverse proxy its own request-size limit applies first and tends to
+        bite far below these numbers: nginx refuses a body larger than 1 MB unless
+        <code>client_max_body_size</code> says otherwise.</li>
+    </ul>`);
+
+  add("Keeping things in place", `
+    <p>Nothing is installed and nothing is configured: the files themselves are the
+    only state. What is kept in memory — thumbnails, folder sizes, finished make
+    runs, WebDAV locks — expires on its own and is gone after a restart. There is no
+    login here: whoever can reach this URL can read and (unless the server runs with
+    <code>--read-only</code>) change everything in it, so put it behind a proxy that
+    authenticates before pointing it at anything you care about.</p>`);
+
+  return '<div class="help">'+rows.join("")+"</div>";
+}
+
+function showHelp(){
+  openModal("Help — " + ROOT_NAME, helpHTML());
+}
+$("#helpBtn").onclick = () => showHelp();
+
+document.addEventListener("keydown", ev => {
+  // ?, /, n and u as shortcuts, except while typing somewhere.
+  const t = ev.target;
+  if(t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT"
+           || t.isContentEditable)) return;
+  if(ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if(ev.key === "?"){ ev.preventDefault(); showHelp(); }
+  else if(ev.key === "/"){ ev.preventDefault(); const f=$("#filter"); if(f) f.focus(); }
+  // The header only keeps the two actions used most, so the rest stay
+  // reachable from the keyboard: n opens the menu they are in, u uploads.
+  else if(ev.key === "n"){ ev.preventDefault(); openMenu("#newBtn"); }
+  else if(ev.key === "u"){
+    ev.preventDefault();
+    if(FEATURES.write) $("#files").click();
+  }
+});
+
 // -- Startup feature flags (--no-shell / --no-run / --no-make / --no-b64 /
 // --read-only) --------------------------------------------------------------
 // The server enforces these too (the endpoints refuse with 403); this only
 // hides the corresponding UI so disabled features don't even appear.
 function applyFeatures(){
-  const hide = (sel, on) => { const el=$(sel); if(el && !on) el.style.display="none"; };
-  hide("#shellBtn", FEATURES.shell);
-  hide("#makeBtn", FEATURES.make);
-  hide("#makeRunBtn", FEATURES.make);
+  const hide = (sel, on) =>
+    document.querySelectorAll(sel).forEach(el => { if(!on) el.style.display="none"; });
+  // A menu group hides whole, label and separator included, so a folder listing
+  // never shows a heading with nothing under it.
+  const makeOn = FEATURES.make && FEATURES.write;
+  const runGroup = makeOn || (FEATURES.shell && FEATURES.write);
+  hide("#makeBtn", makeOn);
+  hide("#makeRunBtn", makeOn);
+  hide("#shellBtn", FEATURES.shell && FEATURES.write);
+  hide('[data-grp="run"]', runGroup);
   hide("#upload64Btn", FEATURES.b64);
   hide("#uploadBtn", FEATURES.write);
-  hide(".menu-wrap", FEATURES.write);  // the "+ New" menu creates things
+  hide("#newWrap", FEATURES.write);  // the "+ New" menu creates things
   const ro=$("#roBadge");
   if(ro) ro.hidden = !!FEATURES.write;
   if(!FEATURES.write) document.querySelectorAll(".c-sel").forEach(el=>el.style.display="none");
@@ -3958,7 +5967,7 @@ updateSortIndicators();
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> None:
     global ROOT, ENABLE_SHELL, ENABLE_RUN, ENABLE_MAKE, ENABLE_B64, ENABLE_WRITE
-    global SHELL_CMD, MAKE_CMD
+    global SHELL_CMD, MAKE_CMD, ENABLE_DAV, DAV_PREFIX
     # This file is run by whatever Python a user has on PATH, not by a project
     # with a pinned requires-python, so the floor really is checked here.
     if sys.version_info < (3, 10):  # noqa: UP036
@@ -3991,7 +6000,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--no-shell",
         action="store_true",
-        help="disable shell access (Shell button, /api/shell)",
+        help="disable shell access (Tools ▸ Shell, /api/shell)",
     )
     ap.add_argument(
         "--no-run",
@@ -4001,7 +6010,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--no-make",
         action="store_true",
-        help="disable make entirely: no automatic rebuilds and no manual Make button",
+        help="disable make entirely: no automatic rebuilds and no manual make "
+        "(the Tools menu)",
     )
     ap.add_argument(
         "--no-b64",
@@ -4009,10 +6019,22 @@ def main(argv: list[str] | None = None) -> None:
         help="disable the base64 upload/download workaround (/api/upload64, /api/download64)",
     )
     ap.add_argument(
+        "--no-dav",
+        action="store_true",
+        help="disable the WebDAV share (mounted with davfs2; see the Help button)",
+    )
+    ap.add_argument(
+        "--dav-path",
+        default=DAV_PREFIX,
+        metavar="PREFIX",
+        help=f"first URL segment of the WebDAV share, one path component "
+        f"(default: {DAV_PREFIX})",
+    )
+    ap.add_argument(
         "--shell-cmd",
         default=SHELL_CMD,
         metavar="PROGRAM",
-        help=f"shell used by the Shell button (default: {SHELL_CMD})",
+        help=f"shell used by the Shell action (default: {SHELL_CMD})",
     )
     ap.add_argument(
         "--make-cmd",
@@ -4030,12 +6052,24 @@ def main(argv: list[str] | None = None) -> None:
     root = Path(args.root or os.getcwd()).expanduser().resolve()
     if not root.is_dir():
         ap.error(f"not a directory: {root}")
+    # The mount lives at one URL segment, so it cannot contain a slash or be
+    # one of the names the page and the JSON API already answer to; a prefix
+    # like "api" would silently swallow every endpoint under /api.
+    prefix = args.dav_path.strip().strip("/")
+    if not prefix or "/" in prefix or prefix in (".", ".."):
+        ap.error(f"--dav-path must be one path segment, not {args.dav_path!r}")
+    if prefix in ("api", "health"):
+        ap.error(
+            f"--dav-path cannot be {prefix!r}: that URL already belongs to the API"
+        )
     ROOT = root
     ENABLE_SHELL = not args.no_shell
     ENABLE_RUN = not args.no_run
     ENABLE_MAKE = not args.no_make
     ENABLE_B64 = not args.no_b64
     ENABLE_WRITE = not args.read_only
+    ENABLE_DAV = not args.no_dav
+    DAV_PREFIX = prefix
     SHELL_CMD = args.shell_cmd
     MAKE_CMD = args.make_cmd
     mimetypes.init()
@@ -4055,6 +6089,16 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Serving: {ROOT}")
     print(f"URL:     http://{args.host}:{args.port}/")
     print("Mode:    " + ", ".join(modes))
+    if ENABLE_DAV:
+        # The davfs2 line is printed because that is the client this mount is
+        # built for, and the details that matter (no auth, one path segment)
+        # are the ones a user otherwise gets wrong.
+        print(f"WebDAV:  http://{args.host}:{args.port}/{DAV_PREFIX}/")
+        print(
+            f"         mount as: mount -t davfs "
+            f"http://{args.host}:{args.port}/{DAV_PREFIX}/ /mnt "
+            f"(or add it to /etc/fstab; see the Help button)"
+        )
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

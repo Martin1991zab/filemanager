@@ -9,12 +9,17 @@
 # There is no authentication and no HTTPS, and the Run/Shell features execute
 # arbitrary commands. Only expose this on a trusted network or behind an
 # authenticating reverse proxy.
+#
+# The served folder is also a WebDAV share, at /dav/, so it can be mounted
+# instead of browsed:
+#   sudo mount -t davfs http://127.0.0.1:8000/dav/ /mnt/data
+# Pass --no-dav to leave that out, or --dav-path PREFIX to move it.
 
 FROM python:3.12-alpine
 
 # Only two tiny helpers are added on top of the Python base image:
 #   bash — used by the Shell feature
-#   make — used by the Make button and automatic make
+#   make — used by the Tools menu's make items and by automatic make
 # Pillow is deliberately omitted; thumbnails fall back to a generic icon.
 # To enable them, add `py3-pillow` to the apk line below.
 RUN apk add --no-cache bash make \
