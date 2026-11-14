@@ -13,9 +13,6 @@ venv/
 .mypy_cache/
 .pytest_cache/
 
-# Generated
-screenshots/
-
 # Environments
 .env
 *.env

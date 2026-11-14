@@ -27,53 +27,80 @@ Everything is stateless: it serves the directory the app was started in
 or metadata. Authentication is expected to be handled by an external
 reverse proxy (there is none here).
 
+Symlinks inside the served tree are listed and browsed; the entry the
+listing shows is the one operations act on, so deleting a symlink to a
+folder removes the link and leaves the linked folder alone. A symlink may
+point outside the served directory (the parent path is still confined).
+
 Run:
     python filemanager.py [directory] [--host HOST] [--port PORT]
-                            [--no-shell] [--no-run] [--no-make] [--no-b64]
+                            [--read-only] [--no-shell] [--no-run]
+                            [--no-make] [--no-b64] [--shell-cmd CMD]
+                            [--make-cmd CMD] [--version]
 
-Uses only the Python standard library, plus (optionally) Pillow for image
-thumbnails. If Pillow is missing, the app still works — it just shows a
-generic icon instead of a thumbnail.
+GET /health answers a small JSON status document (used by the Docker
+health check); everything else lives under /api/* and speaks JSON.
+
+Uses only the Python standard library (3.10 or newer), plus (optionally)
+Pillow for image thumbnails. If Pillow is missing, the app still works:
+it shows a generic icon instead of a thumbnail (SVG previews still work,
+because the browser draws those itself).
 """
 
 import argparse
 import base64
 import binascii
+import contextlib
+import errno
+import importlib.util
 import io
 import json
 import mimetypes
 import os
 import selectors
 import shlex
-import signal
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import zipfile
+import zlib
 from collections import OrderedDict
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO, TypedDict
 from urllib.parse import parse_qs, quote, unquote, urlparse
-import zipfile
-import zlib
 
 # ---------------------------------------------------------------------------
 # Limits / tuning (edit to taste)
 # ---------------------------------------------------------------------------
+VERSION = "1.1"
 THUMB_SIZE = (120, 120)  # max thumbnail dimension (px)
+THUMB_MAX_PIXELS = 100_000_000  # Pillow refuses to decode images above this
 MAX_RUN_OUTPUT = 1024 * 1024  # 1 MB cap on captured output per run
 RUN_TIMEOUT = 60  # default run timeout (seconds)
 RUN_MAX_TIMEOUT = 3600  # hard cap on run timeout (seconds)
 MAX_TEXT_SIZE = 20 * 1024 * 1024  # /api/text refuses to load files above this
 MAX_B64_FILE_SIZE = 128 * 1024 * 1024  # /api/download64 file-size limit
 MAX_B64_BODY_SIZE = 128 * 1024 * 1024  # /api/upload64 request-body limit
+MAX_JSON_BODY_SIZE = 64 * 1024 * 1024  # cap on any JSON request body
+MAX_ZIP_ENTRY_SIZE = 2 * 1024 * 1024 * 1024  # /api/extract per-entry size limit
+MAX_ZIP_TOTAL_SIZE = 4 * 1024 * 1024 * 1024  # /api/extract total output limit
+READ_TIMEOUT = 30  # idle socket timeout: headers, body and stalled writes
+LIST_MAX_ENTRIES = 20_000  # /api/list caps the entries it returns
+DIR_SIZE_CACHE_TTL = 30  # seconds a computed folder size may be reused
+DIR_SIZE_SCAN_BUDGET = 2_000_000  # directory entries scanned per /api/foldersize
 THUMB_CACHE_MAX_ENTRIES = 512  # rendered thumbnails kept in memory
 THUMB_CACHE_MAX_BYTES = 64 * 1024 * 1024
-SHELL_CMD = "bash"  # shell used for the Shell button
+SVG_THUMB_LIMIT = 2 * 1024 * 1024  # SVGs are served to <img> as-is, up to this
+MAKE_MAX_CONCURRENT = 4  # builds running at once, across all folders
+MAKE_JOB_POLL_MS = 400  # how often the browser polls a make job
+SHELL_CMD = "bash"  # shell used for the Shell button (override: --shell-cmd)
 MAKE_CMD = "make"  # run automatically after edits/uploads when a Makefile is present
 # On Windows, X_OK is True for nearly every file, so gate the Run button on
 # a known executable/script extension there. On POSIX the exec bit is enough.
@@ -94,6 +121,8 @@ IMAGE_EXTS = {
     ".heif",
     ".avif",
 }
+# Images Pillow can render into a thumbnail. .svg is not in here: those are
+# served to the browser as-is and need no decoding (see render_thumbnail).
 THUMB_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico"}
 TEXT_EXTS = {
     ".txt",
@@ -221,6 +250,10 @@ ENABLE_SHELL: bool = True  # Shell button / /api/shell
 ENABLE_RUN: bool = True  # run executables / /api/run
 ENABLE_MAKE: bool = True  # automatic rebuilds + manual Make button
 ENABLE_B64: bool = True  # base64 upload/download (/api/upload64, /api/download64)
+ENABLE_WRITE: bool = True  # write access (--read-only turns this off)
+
+# When the process started, reported by /health.
+START_TIME = time.time()
 
 # Parsed query string, as returned by urllib.parse.parse_qs.
 Qs = dict[str, list[str]]
@@ -250,12 +283,110 @@ class HTTPError(Exception):
 # Helpers
 # ---------------------------------------------------------------------------
 def safe_path(rel: str) -> Path:
-    """Resolve a client-supplied relative path, forcing it to stay under ROOT."""
-    rel = (rel or "").strip().replace("\\", "/").lstrip("/")
-    p = (ROOT / rel).resolve()
-    if p != ROOT and ROOT not in p.parents:
+    """Resolve a client-supplied relative path, forcing it to stay under ROOT.
+
+    Everything but the last component is resolved, so ".." and symlinked
+    parent folders are still kept inside the root. The last component is
+    deliberately returned unresolved: with docs/latest -> docs/1.2 the caller
+    must get "docs/latest" back, otherwise delete/rename/move would silently
+    act on the linked folder instead of on the link shown in the listing.
+
+    A final symlink may point outside the root: the entry itself is inside
+    it, and following it is what the user expects from a single-user tool
+    whose access control lives in a reverse proxy.
+    """
+    rel = (rel or "").replace("\\", "/").lstrip("/")
+    if "\x00" in rel:
+        raise HTTPError(400, "Path cannot contain a NUL byte")
+    parts = [part for part in rel.split("/") if part not in ("", ".")]
+    name = parts.pop() if parts else ""
+    # Fold the parent components starting at the root, so ".." can only ever
+    # climb as far as the root and then stops there instead of escaping (or
+    # turning a harmless "cd .." too many into an error).
+    parent = ROOT
+    for part in parts:
+        if part == "..":
+            if parent != ROOT:
+                parent = parent.parent
+        else:
+            parent = parent / part
+    # Resolving here is what catches a symlinked parent folder pointing out of
+    # the root; the returned leaf itself stays unresolved (see above).
+    parent = parent.resolve()
+    if parent != ROOT and ROOT not in parent.parents:
         raise HTTPError(403, "Path is outside the root directory")
-    return p
+    if name in ("", "."):
+        return parent
+    if name == "..":
+        up = parent.parent
+        return up if (up == ROOT or ROOT in up.parents) else ROOT
+    return parent / name
+
+
+def entry_exists(p: Path) -> bool:
+    """True when p exists, including a dangling symlink."""
+    try:
+        p.lstat()
+    except OSError:
+        return False
+    return True
+
+
+def is_link_to_dir(p: Path) -> bool:
+    """True for a real directory, but False for a symlink pointing at one."""
+    try:
+        return stat.S_ISDIR(p.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def link_target(p: str | Path) -> str | None:
+    """The readlink() target of a symlink, or None for any other entry."""
+    try:
+        return os.readlink(p)
+    except OSError:
+        return None
+
+
+@contextlib.contextmanager
+def os_errors(hint: str) -> Iterator[None]:
+    """Translate OSError into a proper HTTPError instead of a bare 500.
+
+    Disk-full, quota and permission failures are ordinary outcomes of file
+    operations, so they get a client-side message that says what went wrong.
+    """
+    try:
+        yield
+    except TimeoutError:
+        raise  # a stalled client is not a filesystem error: let it become 408
+    except FileNotFoundError:
+        raise HTTPError(404, f"{hint}: not found")
+    except FileExistsError:
+        raise HTTPError(409, "A file or folder with that name already exists")
+    except NotADirectoryError:
+        raise HTTPError(400, f"{hint}: a component of the path is not a folder")
+    except IsADirectoryError:
+        raise HTTPError(400, f"{hint}: expected a file, found a folder")
+    except PermissionError:
+        raise HTTPError(403, f"{hint}: permission denied")
+    except OSError as e:
+        if e.errno in (errno.ENOSPC, errno.EDQUOT, errno.EFBIG):
+            raise HTTPError(413, f"{hint}: no space left on the device")
+        raise HTTPError(500, f"{hint}: {e.strerror or e}")
+
+
+_HAVE_PILLOW: bool | None = None
+
+
+def pillow_available() -> bool:
+    """True when Pillow can be imported; the lookup happens once."""
+    global _HAVE_PILLOW
+    if _HAVE_PILLOW is None:
+        try:
+            _HAVE_PILLOW = importlib.util.find_spec("PIL") is not None
+        except (ImportError, ValueError):
+            _HAVE_PILLOW = False
+    return _HAVE_PILLOW
 
 
 def rel_of(p: Path) -> str:
@@ -385,22 +516,20 @@ def _run_captured(
         pass
     finally:
         sel.close()
+        with contextlib.suppress(OSError):  # the pipe, not the child's memory
+            proc.stdout.close()
 
     if timed_out:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:  # noqa: BLE001
-            try:
+        except Exception:  # noqa: BLE001 - the process may already be gone
+            with contextlib.suppress(Exception):
                 proc.kill()
-            except Exception:
-                pass
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        try:
+        with contextlib.suppress(Exception):
             proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
         proc.wait()
 
     code = None if timed_out else proc.returncode
@@ -453,7 +582,9 @@ class _MakeJobs:
     per directory at a time, and jobs submitted while a build is running
     are coalesced: they wait and share the result of the next build, so
     a burst of uploads triggers one rebuild per burst instead of one
-    blocking make per file.
+    blocking make per file. Builds in different folders are limited by
+    MAKE_MAX_CONCURRENT so a wide tree cannot fork an unbounded number of
+    compilers.
     """
 
     def __init__(self, ttl: float) -> None:
@@ -465,6 +596,7 @@ class _MakeJobs:
             str, list[str]
         ] = {}  # directory (str) -> [job ids] awaiting a build
         self._active: set[str] = set()  # directories with a build running
+        self._slots = threading.BoundedSemaphore(MAKE_MAX_CONCURRENT)
         self._ttl = ttl
 
     def _sweep(self) -> None:
@@ -496,7 +628,8 @@ class _MakeJobs:
 
         def work():
             try:
-                result = run_make_if_present(Path(d))
+                with self._slots:
+                    result = run_make_if_present(Path(d))
             except HTTPError as e:
                 result = {
                     "code": None,
@@ -512,7 +645,10 @@ class _MakeJobs:
                         e[1] = True
                         e[2] = result
                 self._active.discard(d)
-                again = bool(self._queues.get(d))
+                left = self._queues.get(d)
+                again = bool(left)
+                if left is not None and not again:
+                    del self._queues[d]  # keep the dict from growing per folder
             if again:
                 self._build(d)
 
@@ -521,6 +657,8 @@ class _MakeJobs:
     def get(self, job: str) -> tuple[bool, RunResult | None] | None:
         """(done, result) for a job, or None if unknown or expired."""
         with self._lock:
+            if len(self._results) > 128:
+                self._sweep()  # pollers keep the table tidy without a sweeper thread
             e = self._results.get(job)
             return (e[1], e[2]) if e else None
 
@@ -584,24 +722,32 @@ def unique_dest(dirp: Path, name: str) -> Path:
         i += 1
 
 
-def validate_new_name(name: str) -> None:
-    """Reject names that would break the filesystem or escape the directory."""
-    name = name.strip()
-    if not name:
+def validate_new_name(name: str) -> str:
+    """Reject names that would break the filesystem or escape the directory,
+    and return the cleaned name (callers must use the result, otherwise a
+    name like " foo " passes validation and is then created with the
+    spaces)."""
+    cleaned = name.strip()
+    if not cleaned:
         raise HTTPError(400, "Name cannot be empty")
-    if name in (".", ".."):
+    if cleaned in (".", ".."):
         raise HTTPError(400, "Invalid name")
-    if "/" in name or "\\" in name or "\x00" in name:
+    if "/" in cleaned or "\\" in cleaned or "\x00" in cleaned:
         raise HTTPError(400, "Name cannot contain path separators")
+    return cleaned
 
 
-def dir_size(p: Path) -> int:
+def dir_size(p: Path, budget: int | None = None) -> tuple[int, int, bool]:
     """Recursively sum the size of all regular files under p (bytes).
 
-    Symlinks (to files or directories) are not counted or followed.
-    Unreadable entries are skipped. One stat per directory entry.
+    Returns (total, entries_scanned, complete). Symlinks (to files or
+    directories) are not counted or followed. Unreadable entries are skipped.
+    One stat per directory entry. When budget is given the walk stops after
+    that many entries and complete is False, so one request can never be
+    forced to walk an unbounded tree.
     """
     total = 0
+    seen = 0
     stack = [p]
     while stack:
         d = stack.pop()
@@ -611,6 +757,9 @@ def dir_size(p: Path) -> int:
             continue
         with it:
             for de in it:
+                if budget is not None and seen >= budget:
+                    return total, seen, False
+                seen += 1
                 try:
                     st = de.stat(follow_symlinks=False)
                 except OSError:
@@ -620,21 +769,127 @@ def dir_size(p: Path) -> int:
                     stack.append(de.path)
                 elif stat.S_ISREG(mode):
                     total += st.st_size
-    return total
+    return total, seen, True
+
+
+class _DirSizeCache:
+    """Short-lived cache of recursive folder sizes.
+
+    Every listing walks all subfolders again (a .git or node_modules tree is
+    re-read on every click), so results are reused for a few seconds. Nothing
+    is stored on disk and the TTL is short, so a changed tree shows up on the
+    next refresh; the app stays stateless in the sense the README means.
+    """
+
+    def __init__(self, ttl: float, max_entries: int = 4096) -> None:
+        self._ttl = ttl
+        self._max_entries = max_entries
+        self._entries: OrderedDict[str, tuple[float, int, bool]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> tuple[int, bool] | None:
+        with self._lock:
+            hit = self._entries.get(key)
+            if hit is None:
+                return None
+            if time.monotonic() - hit[0] > self._ttl:
+                del self._entries[key]
+                return None
+            self._entries.move_to_end(key)
+            return hit[1], hit[2]
+
+    def put(self, key: str, size: int, complete: bool) -> None:
+        with self._lock:
+            self._entries[key] = (time.monotonic(), size, complete)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def invalidate(self, key: str) -> None:
+        """Drop key, everything under it and everything containing it.
+
+        Called after a write so the listing next to the changed file does not
+        keep showing a size from before the edit.
+        """
+        with self._lock:
+            prefix = key.rstrip(os.sep) + os.sep
+            for k in [
+                k
+                for k in self._entries
+                if k == key or k.startswith(prefix) or key.startswith(k + os.sep)
+            ]:
+                del self._entries[k]
+
+
+DIR_SIZES = _DirSizeCache(DIR_SIZE_CACHE_TTL)
+
+
+def sizes_changed(p: Path) -> None:
+    """Forget cached recursive sizes affected by a change inside p."""
+    DIR_SIZES.invalidate(str(p))
+
+
+def _copy_capped(src: BinaryIO, out: BinaryIO, room: int, name: str) -> int:
+    """Copy at most room bytes from src to out, refusing a bigger entry.
+
+    The declared size in a zip header is only a hint, so the real byte count
+    is what decides: a small archive whose headers lie can still not write
+    more than the configured limit.
+    """
+    written = 0
+    while True:
+        chunk = src.read(1024 * 1024)
+        if not chunk:
+            break
+        written += len(chunk)
+        if written > room:
+            raise HTTPError(
+                413,
+                f"Zip entry {name!r} expands beyond the "
+                f"{MAX_ZIP_TOTAL_SIZE // (1024 * 1024 * 1024)} GB extract limit",
+            )
+        out.write(chunk)
+    return written
 
 
 def extract_zip(zip_path: Path, dest_dir: Path) -> dict[str, Any]:
     """Extract zip_path into dest_dir, refusing entries that would escape
-    it (zip-slip) or overwrite the archive itself. Returns a summary."""
+    it (zip-slip) or overwrite the archive itself. Returns a summary.
+
+    Sizes are checked twice: the declared sizes are summed up front (so an
+    obvious zip bomb is refused before writing anything) and the bytes
+    actually written are capped while copying (so lying headers cannot
+    expand past the limit).
+    """
     dest_dir = dest_dir.resolve()
     try:
         zf = zipfile.ZipFile(zip_path)
     except zipfile.BadZipFile:
         raise HTTPError(400, "Not a valid zip file")
     with zf:
+        infos = zf.infolist()
+        declared = 0
+        for info in infos:
+            if info.is_dir():
+                continue
+            if info.file_size > MAX_ZIP_ENTRY_SIZE:
+                raise HTTPError(
+                    413,
+                    f"Zip entry {info.filename!r} is {info.file_size // (1024 * 1024)} MB "
+                    f"and exceeds the per-entry limit "
+                    f"({MAX_ZIP_ENTRY_SIZE // (1024 * 1024 * 1024)} GB)",
+                )
+            declared += info.file_size
+        if declared > MAX_ZIP_TOTAL_SIZE:
+            raise HTTPError(
+                413,
+                f"This zip expands to {declared // (1024 * 1024 * 1024)} GB, over the "
+                f"{MAX_ZIP_TOTAL_SIZE // (1024 * 1024 * 1024)} GB extract limit",
+            )
         entries = 0
         total = 0
-        for info in zf.infolist():
+        room = MAX_ZIP_TOTAL_SIZE
+        for info in infos:
             member = info.filename.replace("\\", "/")
             target = (dest_dir / member).resolve()
             if target != dest_dir and dest_dir not in target.parents:
@@ -651,7 +906,8 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> dict[str, Any]:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, target.open("wb") as out:
-                shutil.copyfileobj(src, out)
+                written = _copy_capped(src, out, room, info.filename)
+            room -= written
             # Restore the stored unix permissions (e.g. exec bits).
             attr = info.external_attr >> 16
             if attr:
@@ -660,7 +916,7 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> dict[str, Any]:
                 except OSError:
                     pass
             entries += 1
-            total += info.file_size
+            total += written
     return {"entries": entries, "bytes": total}
 
 
@@ -692,11 +948,187 @@ class _ChunkedZipSink:
 
 
 # ---------------------------------------------------------------------------
+# Response helpers
+# ---------------------------------------------------------------------------
+def parse_byte_range(header: str, size: int) -> tuple[int, int] | None:
+    """Parse a single "bytes=a-b", "bytes=a-" or "bytes=-n" range.
+
+    Returns an inclusive (start, end) pair, or None when the header asks for
+    something this server does not slice (a multi-range list, an unknown
+    unit, an unsatisfiable range). Returning None means "send the whole
+    file", which is always a valid response.
+    """
+    if size <= 0:
+        return None
+    unit, _sep, spec = header.partition("=")
+    spec = spec.strip()
+    if unit.strip().lower() != "bytes" or not spec or "," in spec:
+        return None
+    low, _dash, high = spec.partition("-")
+    try:
+        if low == "":
+            suffix = int(high)
+            if suffix <= 0:
+                return None
+            start, end = max(0, size - suffix), size - 1
+        else:
+            start = int(low)
+            end = int(high) if high else size - 1
+            end = min(end, size - 1)
+            if start > end or start >= size:
+                return None
+    except ValueError:
+        return None
+    return start, end
+
+
+def content_disposition(mode: str, name: str) -> str:
+    """Build a Content-Disposition value with an ASCII fallback plus the
+    RFC 6266 filename*, so a non-ASCII name survives everywhere instead of
+    arriving percent-encoded."""
+    fallback = "".join(
+        ch if ch.isascii() and ch.isprintable() and ch != '"' else " "
+        for ch in name.replace("\r", " ").replace("\n", " ")
+    ).strip()
+    if not fallback:
+        fallback = "download"
+    return f"{mode}; filename=\"{fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
+
+
+def features() -> dict[str, bool]:
+    """Feature switches the server enforces, mirrored into the page."""
+    return {
+        "shell": ENABLE_SHELL,
+        "run": ENABLE_RUN,
+        "make": ENABLE_MAKE,
+        "b64": ENABLE_B64,
+        "write": ENABLE_WRITE,
+    }
+
+
+def render_thumbnail(p: Path) -> tuple[str, bytes]:
+    """Render p as a thumbnail no wider/taller than THUMB_SIZE.
+
+    Returns (image subtype, bytes), e.g. ("jpeg", ...). SVG is passed
+    through untouched: the browser draws it itself, so SVG previews work
+    without Pillow.
+    """
+    ext = p.suffix.lower()
+    if ext == ".svg":
+        try:
+            size = p.stat().st_size
+        except OSError:
+            raise HTTPError(404, "File not found")
+        if size > SVG_THUMB_LIMIT:
+            raise HTTPError(
+                413,
+                f"SVG is too large to preview "
+                f"(limit {SVG_THUMB_LIMIT // (1024 * 1024)} MB)",
+            )
+        return ("svg+xml", p.read_bytes())
+    try:
+        from PIL import Image
+    except ImportError:
+        raise HTTPError(
+            501, "Pillow is not installed; thumbnails unavailable (pip install Pillow)"
+        )
+    try:
+        # Refuse absurdly large images outright (Pillow only warns by default)
+        # and let the JPEG decoder downscale while reading: a 48 MP photo costs
+        # about the same as a 120 px one when it is never decoded full size.
+        Image.MAX_IMAGE_PIXELS = THUMB_MAX_PIXELS
+        with Image.open(p) as im:
+            im.draft(None, THUMB_SIZE)
+            im.load()
+            from PIL import ImageOps
+
+            with contextlib.suppress(Exception):  # odd EXIF is common
+                im = ImageOps.exif_transpose(im)  # orientation-correct photos
+            im.thumbnail(THUMB_SIZE)
+            want_alpha = (
+                "A" in im.mode
+                or im.mode == "P"
+                or ext in (".png", ".gif", ".webp", ".ico")
+            )
+            buf = io.BytesIO()
+            if want_alpha:
+                if im.mode not in ("RGBA", "LA", "P"):
+                    im = im.convert("RGBA")
+                im.save(buf, "PNG")
+                return ("png", buf.getvalue())
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(buf, "JPEG", quality=82)
+            return ("jpeg", buf.getvalue())
+    except HTTPError:
+        raise
+    except Exception:  # noqa: BLE001 - Pillow raises freely on odd files
+        # Pillow throws whatever it likes at a bad image: UnidentifiedImageError
+        # for a file it cannot recognise, DecodingError from its C decoders,
+        # DecompressionBombError above MAX_IMAGE_PIXELS, and plain OSErrors for
+        # truncated files. They are all "this file is not a viewable image".
+        raise HTTPError(
+            400, "Could not decode this image (corrupt, unsupported, or too large)"
+        )
+
+
+# The page is static apart from two placeholders, so it is rendered once.
+_PAGE_HTML: bytes | None = None
+
+
+def page_html() -> bytes:
+    """The embedded front-end, with the root name and tuning values in."""
+    global _PAGE_HTML
+    if _PAGE_HTML is None:
+        _PAGE_HTML = (
+            HTML_TEMPLATE.replace(
+                "__ROOT_NAME__", json.dumps(ROOT.name or str(ROOT), ensure_ascii=False)
+            )
+            .replace("__FEATURES__", json.dumps(features()))
+            .replace("__MAKE_POLL_MS__", str(MAKE_JOB_POLL_MS))
+            .encode("utf-8")
+        )
+    return _PAGE_HTML
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FileManager/1.0"
+    server_version = f"FileManager/{VERSION}"
     protocol_version = "HTTP/1.1"
+    # A client that sends a header or body byte and then stalls can no longer
+    # park a request thread forever (slow-loris); idle keep-alive sockets are
+    # closed after the same idle period.
+    timeout = READ_TIMEOUT
+    # Small JSON responses go out immediately instead of waiting for the
+    # peer's next ACK, which is what makes the UI feel snappy.
+    disable_nagle_algorithm = True
+
+    # Set once a status line has been written for the current request; see _fail.
+    _resp_started = False
+    # "unread" | "done" | "unknown": whether the request body can still be
+    # skipped without breaking keep-alive; see _body_chunks and _fail.
+    _body_state = "unread"
+
+    # -- per-request plumbing ----------------------------------------------
+    def handle_one_request(self) -> None:
+        """Wrap the stock request loop with body bookkeeping.
+
+        Two things happen around every request: the per-request state is
+        reset (one handler instance serves a whole keep-alive connection),
+        and a body that no endpoint read is discarded afterwards. Without
+        that, the leftovers are parsed as the next request line and the
+        client gets a 501 for a request it never sent.
+        """
+        self._begin_request()
+        super().handle_one_request()
+        if (
+            self._body_state == "unread"
+            and not self.close_connection
+            and not self._drain_body()
+        ):
+            self.close_connection = True
 
     # -- request logging ---------------------------------------------------
     def _client_ua(self) -> str:
@@ -713,8 +1145,11 @@ class Handler(BaseHTTPRequestHandler):
         The stock handler omits request headers, which makes anonymous
         probes (e.g. a monitor hitting /health) impossible to attribute.
         Control characters are stripped so a crafted UA cannot forge log
-        lines, and the value is capped to keep lines readable.
+        lines, and the value is capped to keep lines readable. The health
+        check is silent: it runs on a timer and would drown the log.
         """
+        if (self.path or "").startswith("/health"):
+            return
         stamp = self.log_date_time_string()
         sys.stderr.write(
             f"{self.address_string()} - - [{stamp}] "
@@ -722,6 +1157,16 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     # -- low-level helpers -------------------------------------------------
+    def _begin_request(self) -> None:
+        """Reset per-request bookkeeping (each handler instance is reused for
+        every request on a keep-alive connection)."""
+        self._resp_started = False
+        self._body_state = "unread"
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self._resp_started = True
+        super().send_response(code, message)
+
     def _send(
         self, code: int, body: bytes, ctype: str, headers: dict[str, str] | None = None
     ) -> None:
@@ -739,67 +1184,161 @@ class Handler(BaseHTTPRequestHandler):
             code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8"
         )
 
-    def send_error_json(self, code: int, msg: str) -> None:
+    def send_error_json(self, code: int, msg: str, keep_alive: bool = False) -> None:
         try:
             body = json.dumps({"error": msg}).encode("utf-8")
-            self.close_connection = True
+            self.close_connection = not keep_alive
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
+            if not keep_alive:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
-        except Exception:
+        except Exception:  # noqa: BLE001
             self.close_connection = True
 
-    def send_html(self) -> None:
-        root_name = ROOT.name or str(ROOT)
-        features = json.dumps(
-            {
-                "shell": ENABLE_SHELL,
-                "run": ENABLE_RUN,
-                "make": ENABLE_MAKE,
-                "b64": ENABLE_B64,
-            }
-        )
-        data = (
-            HTML_TEMPLATE.replace(
-                "__ROOT_NAME__", json.dumps(root_name, ensure_ascii=False)
-            )
-            .replace("__FEATURES__", features)
-            .encode("utf-8")
-        )
-        self._send(
-            200,
-            data,
-            "text/html; charset=utf-8",
-            {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
-        )
+    def _fail(self, code: int, msg: str, bodyless: bool = False) -> None:
+        """Report an error as JSON, reusing the connection where that is safe.
 
-    def stream_file(self, p: Path, attachment: bool) -> None:
-        ctype, _ = mimetypes.guess_type(p.name)
-        ctype = ctype or "application/octet-stream"
-        mode = "attachment" if attachment else "inline"
-        fname = quote(os.path.basename(p.name))
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(p.stat().st_size))
-        self.send_header("Content-Disposition", f'{mode}; filename="{fname}"')
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        try:
-            with p.open("rb") as f:
-                while True:
-                    chunk = f.read(1024 * 1024)
+        An error is usually raised before any output has been written, so the
+        response is complete and only an unread request body can stop the
+        connection from being reused: such a body is drained when it is small
+        enough to discard cheaply. Once headers are on the wire the response
+        is already committed, so the connection has to go.
+        """
+        if bodyless:
+            self.send_response(code)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self._resp_started:
+            self.send_error_json(code, msg)
+            return
+        keep_alive = self._body_state == "unread" and self._drain_body()
+        self.send_error_json(code, msg, keep_alive=keep_alive)
+
+    def _fail_http(self, err: HTTPError) -> None:
+        self._fail(err.code, err.msg)
+
+    def _body_chunks(self) -> Iterator[bytes]:
+        """Yield the request body, for both Content-Length and chunked bodies.
+
+        Chunked bodies used to be read as zero bytes, which turned a valid
+        upload into a silently truncated (or empty) file.
+        """
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            while True:
+                line = self.rfile.readline(128)
+                try:
+                    n = int(line.split(b";")[0].strip() or b"0", 16)
+                except ValueError:
+                    raise HTTPError(400, "Malformed chunked request body")
+                if n == 0:
+                    self._read_trailers()
+                    return
+                got = 0
+                while got < n:
+                    chunk = self.rfile.read(min(n - got, 1024 * 1024))
                     if not chunk:
-                        break
-                    self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            self.close_connection = True
+                        raise HTTPError(400, "Incomplete chunked request body")
+                    got += len(chunk)
+                    yield chunk
+                self.rfile.read(2)  # the CRLF that closes every chunk
+            return
+        try:
+            remaining = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            raise HTTPError(400, "Invalid Content-Length header")
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise HTTPError(
+                    400,
+                    "Incomplete request body: the client sent fewer bytes than "
+                    "Content-Length promised",
+                )
+            remaining -= len(chunk)
+            yield chunk
 
-    def _read_body(self) -> bytes:
-        n = int(self.headers.get("Content-Length", 0) or 0)
-        return self.rfile.read(n) if n > 0 else b""
+    def _read_trailers(self) -> None:
+        """Consume and ignore the trailer block that closes a chunked body."""
+        while True:
+            line = self.rfile.readline(1024)
+            if not line or line in (b"\r\n", b"\n"):
+                return
+
+    def _read_body(self, max_bytes: int | None = None) -> bytes:
+        """Read a request body into memory, capped so a client cannot OOM us.
+
+        The cap is looked up per call rather than as a default argument, which
+        would have frozen the constant when this module was imported.
+        """
+        limit = MAX_JSON_BODY_SIZE if max_bytes is None else max_bytes
+        self._body_state = "unknown"
+        parts: list[bytes] = []
+        size = 0
+        for chunk in self._body_chunks():
+            size += len(chunk)
+            if size > limit:
+                raise HTTPError(
+                    413,
+                    f"Request body is too large (limit {limit // (1024 * 1024)} MB)",
+                )
+            parts.append(chunk)
+        self._body_state = "done"
+        return b"".join(parts)
+
+    def _read_body_to_file(self, dest: Path) -> int:
+        """Stream the request body into dest and return the byte count."""
+        self._body_state = "unknown"
+        size = 0
+        with dest.open("wb") as out:
+            for chunk in self._body_chunks():
+                size += len(chunk)
+                out.write(chunk)
+        self._body_state = "done"
+        return size
+
+    def _drain_body(self, limit: int = 4 * 1024 * 1024) -> bool:
+        """Discard an unread request body; False means close the connection."""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if (
+                "chunked" not in (self.headers.get("Transfer-Encoding") or "").lower()
+                and length > limit
+            ):
+                return False
+            self._body_state = "unknown"
+            for chunk in self._body_chunks():
+                limit -= len(chunk)
+                if limit < 0:
+                    return False
+            self._body_state = "done"
+            return True
+        except (HTTPError, OSError, ValueError):
+            return False
+
+    def _json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
+        """Parse a JSON object body, or {} when there is none."""
+        body = self._read_body(max_bytes)
+        if not body:
+            return {}
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise HTTPError(400, "Invalid JSON body")
+        if not isinstance(payload, dict):
+            raise HTTPError(400, "Expected a JSON object")
+        return payload
+
+    def _require_write(self, what: str) -> None:
+        if not ENABLE_WRITE:
+            raise HTTPError(
+                403,
+                f"{what.capitalize()} is not allowed: "
+                f"this server runs in read-only mode",
+            )
 
     def _file(self, qs: Qs) -> Path:
         p = safe_path(qs.get("path", [""])[0])
@@ -829,6 +1368,81 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return {"job": MAKE_JOBS.submit(dirp)}
 
+    def make_hint(self, resp: dict[str, Any], dirp: Path) -> dict[str, Any]:
+        """Add the background-make info to a mutation response, if due."""
+        result = self.maybe_run_make(dirp)
+        if result is not None:
+            resp["make"] = result
+        return resp
+
+    def send_html(self) -> None:
+        self._send(
+            200,
+            page_html(),
+            "text/html; charset=utf-8",
+            {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+        )
+
+    def ep_health(self, head_only: bool = False) -> None:
+        """Liveness probe: cheap to serve, silent in the log."""
+        body = json.dumps(
+            {
+                "ok": True,
+                "version": VERSION,
+                "uptime": round(time.time() - START_TIME, 1),
+                "root": ROOT.name or str(ROOT),
+                "read_only": not ENABLE_WRITE,
+                "pillow": pillow_available(),
+            }
+        ).encode("utf-8")
+        if head_only:
+            self._head_only(200, "application/json; charset=utf-8", len(body))
+        else:
+            self._send(200, body, "application/json; charset=utf-8")
+
+    def stream_file(self, p: Path, attachment: bool, head_only: bool = False) -> None:
+        """Send a file, honouring a single byte Range so media can seek and
+        downloads can resume; HEAD gets the same headers without the body."""
+        ctype, _ = mimetypes.guess_type(p.name)
+        ctype = ctype or "application/octet-stream"
+        try:
+            size = p.stat().st_size
+        except OSError:
+            raise HTTPError(404, "File not found")
+        start, end = 0, max(size - 1, 0)
+        partial = False
+        header = self.headers.get("Range")
+        if header and not head_only:
+            found = parse_byte_range(header, size)
+            if found is not None:
+                start, end = found
+                partial = True
+        mode = "attachment" if attachment else "inline"
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(max(end - start + 1, 0)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Disposition", content_disposition(mode, p.name))
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if head_only:
+            return
+        try:
+            with p.open("rb") as f:
+                if start:
+                    f.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = f.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            self.close_connection = True
+
     # -- routing -----------------------------------------------------------
     def do_GET(self) -> None:
         try:
@@ -837,6 +1451,8 @@ class Handler(BaseHTTPRequestHandler):
             path = parsed.path
             if path == "/":
                 self.send_html()
+            elif path == "/health":
+                self.ep_health()
             elif path == "/api/list":
                 self.ep_list(qs)
             elif path == "/api/download":
@@ -857,11 +1473,50 @@ class Handler(BaseHTTPRequestHandler):
                 rel = unquote(path[len("/api/thumbnail/") :])
                 self.ep_thumbnail(rel)
             else:
-                self.send_error_json(404, "Not found")
+                self._fail(404, "Not found")
         except HTTPError as e:
-            self.send_error_json(e.code, e.msg)
+            self._fail_http(e)
+        except TimeoutError:
+            self.send_error_json(408, "Timed out reading the request")
         except Exception as e:  # noqa: BLE001
-            self.send_error_json(500, f"Server error: {e}")
+            self._fail(500, f"Server error: {e}")
+
+    def do_HEAD(self) -> None:
+        """Headers only, so curl -I, link checkers and media players work."""
+        try:
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            path = parsed.path
+            if path == "/":
+                self._head_only(200, "text/html; charset=utf-8", len(page_html()))
+            elif path == "/health":
+                self.ep_health(head_only=True)
+            elif path in ("/api/download", "/api/raw"):
+                self.stream_file(
+                    self._file(qs), attachment=path == "/api/download", head_only=True
+                )
+            elif path.startswith("/api/thumbnail/"):
+                rel = unquote(path[len("/api/thumbnail/") :])
+                self.ep_thumbnail(rel, head_only=True)
+            else:
+                self._fail(404, "Not found", bodyless=True)
+        except HTTPError as e:
+            self._fail(e.code, e.msg, bodyless=True)
+        except Exception as e:  # noqa: BLE001
+            self._fail(500, f"Server error: {e}", bodyless=True)
+
+    def _head_only(
+        self, code: int, ctype: str, length: int, headers: dict[str, str] | None = None
+    ) -> None:
+        """Answer a HEAD request: the headers a GET would produce, no body."""
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if headers:
+            for k, v in headers.items():
+                self.send_header(k, v)
+        self.end_headers()
 
     def do_POST(self) -> None:
         try:
@@ -882,6 +1537,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.ep_rename(qs)
             elif path == "/api/move":
                 self.ep_move(qs)
+            elif path == "/api/copy":
+                self.ep_copy(qs)
             elif path == "/api/foldersize":
                 self.ep_foldersize(qs)
             elif path == "/api/extract":
@@ -895,11 +1552,13 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/shell":
                 self.ep_shell(qs)
             else:
-                self.send_error_json(404, "Not found")
+                self._fail(404, "Not found")
         except HTTPError as e:
-            self.send_error_json(e.code, e.msg)
+            self._fail_http(e)
+        except TimeoutError:
+            self.send_error_json(408, "Timed out reading the request body")
         except Exception as e:  # noqa: BLE001
-            self.send_error_json(500, f"Server error: {e}")
+            self._fail(500, f"Server error: {e}")
 
     # -- endpoints ---------------------------------------------------------
     def ep_list(self, qs: Qs) -> None:
@@ -907,7 +1566,8 @@ class Handler(BaseHTTPRequestHandler):
         if not p.is_dir():
             raise HTTPError(404, "Directory not found")
         prefix = rel_of(p)
-        entries = []
+        have_pillow = pillow_available()
+        entries: list[dict[str, Any]] = []
         try:
             it = os.scandir(p)
         except OSError:
@@ -915,7 +1575,7 @@ class Handler(BaseHTTPRequestHandler):
         with it:
             for de in it:
                 try:
-                    st = de.stat()  # follow symlinks (as before)
+                    st = de.stat()  # follow symlinks: show the target's kind
                 except OSError:
                     try:  # broken symlink: still show it
                         st = de.stat(follow_symlinks=False)
@@ -924,6 +1584,7 @@ class Handler(BaseHTTPRequestHandler):
                 is_dir = stat.S_ISDIR(st.st_mode)
                 is_reg = stat.S_ISREG(st.st_mode)
                 ext = os.path.splitext(de.name)[1].lower()
+                is_link = de.is_symlink()
                 entries.append(
                     {
                         "name": de.name,
@@ -932,102 +1593,168 @@ class Handler(BaseHTTPRequestHandler):
                         "size": st.st_size if is_reg else None,
                         "ctime": created_time(st),
                         "mtime": st.st_mtime,
-                        "thumb": is_reg and ext in THUMB_EXTS,
+                        # SVG renders straight from the file, everything else
+                        # needs Pillow; without it the icon fallback is used
+                        # and no thumbnail is even requested.
+                        "thumb": bool(
+                            is_reg
+                            and (ext == ".svg" or (have_pillow and ext in THUMB_EXTS))
+                        ),
                         "run": ENABLE_RUN and is_reg and is_executable(de.path, st),
+                        "link": link_target(de.path) if is_link else None,
+                        "broken": not is_dir and not is_reg,
                     }
                 )
+        total = len(entries)
         entries.sort(key=lambda e: (e["kind"] != "dir", e["name"].lower()))
+        # A huge folder is truncated (folders first, then by name) rather than
+        # turning into a multi-megabyte response and tens of thousands of rows.
+        truncated = total > LIST_MAX_ENTRIES
+        if truncated:
+            entries = entries[:LIST_MAX_ENTRIES]
         parent = None
         if p != ROOT:
             parent = "" if p.parent == ROOT else rel_of(p.parent)
-        self.send_json({"path": rel_of(p), "parent": parent, "entries": entries})
+        self.send_json(
+            {
+                "path": rel_of(p),
+                "parent": parent,
+                "entries": entries,
+                "total": total,
+                "truncated": truncated,
+            }
+        )
 
     def ep_mkdir(self, qs: Qs) -> None:
+        self._require_write("Creating folders")
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot modify the root directory")
-        if p.exists():
+        validate_new_name(p.name)
+        if entry_exists(p):
             raise HTTPError(409, "A file or folder with that name already exists")
         if not p.parent.is_dir():
             raise HTTPError(404, "Parent folder not found")
-        p.mkdir()
+        with os_errors("Could not create the folder"):
+            p.mkdir()
+        sizes_changed(p.parent)
         self.send_json({"ok": True, "path": rel_of(p)})
 
     def ep_newfile(self, qs: Qs) -> None:
         """Create an empty file (used by the 'New text file' menu item)."""
+        self._require_write("Creating files")
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot create a file at the root path")
-        if p.exists():
+        validate_new_name(p.name)
+        if entry_exists(p):
             raise HTTPError(409, "A file or folder with that name already exists")
         if not p.parent.is_dir():
             raise HTTPError(404, "Parent folder not found")
-        p.write_bytes(b"")
+        with os_errors("Could not create the file"):
+            p.write_bytes(b"")
+        sizes_changed(p.parent)
         self.send_json({"ok": True, "path": rel_of(p)})
 
     def ep_delete(self, qs: Qs) -> None:
+        self._require_write("Deleting")
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot delete the root directory")
-        if not p.exists():
+        if not entry_exists(p):
             raise HTTPError(404, "Not found")
         parent = p.parent
-        if p.is_dir():
-            shutil.rmtree(p)
-        else:
-            p.unlink()
-        make_result = self.maybe_run_make(parent)
-        resp = {"ok": True}
-        if make_result is not None:
-            resp["make"] = make_result
-        self.send_json(resp)
+        with os_errors("Could not delete"):
+            if is_link_to_dir(p):
+                shutil.rmtree(p)
+            else:
+                # Files, symlinks (even to a folder) and special entries: remove
+                # the entry itself, never whatever a link happens to point at.
+                p.unlink()
+        sizes_changed(parent)
+        self.send_json(self.make_hint({"ok": True}, parent))
 
     def ep_rename(self, qs: Qs) -> None:
+        self._require_write("Renaming")
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot rename the root directory")
-        if not p.exists():
+        if not entry_exists(p):
             raise HTTPError(404, "Not found")
-        body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPError(400, "Invalid JSON body")
+        payload = self._json_body()
         new_name = payload.get("name", "")
-        validate_new_name(new_name)
+        if not isinstance(new_name, str):
+            raise HTTPError(400, "'name' must be a string")
+        new_name = validate_new_name(new_name)
         dest = p.parent / new_name
         if dest == p:
             raise HTTPError(400, "New name is the same as the current name")
-        if dest.exists():
+        if entry_exists(dest):
             raise HTTPError(409, "A file or folder with that name already exists here")
-        p.rename(dest)
-        self.send_json({"ok": True, "path": rel_of(dest), "name": new_name})
+        with os_errors("Could not rename"):
+            p.rename(dest)
+        sizes_changed(p.parent)
+        self.send_json(
+            self.make_hint(
+                {"ok": True, "path": rel_of(dest), "name": new_name}, p.parent
+            )
+        )
 
-    def ep_move(self, qs: Qs) -> None:
+    def _move_copy_target(self, qs: Qs, action: str) -> tuple[Path, Path]:
+        """Shared validation for move/copy: returns (source, dest folder)."""
+        self._require_write(action)
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
-            raise HTTPError(400, "Cannot move the root directory")
-        if not p.exists():
+            raise HTTPError(400, f"Cannot {action} the root directory")
+        if not entry_exists(p):
             raise HTTPError(404, "Not found")
-        body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPError(400, "Invalid JSON body")
-        dest_dir_rel = payload.get("dest", "")
-        dest_dir = safe_path(dest_dir_rel)
+        payload = self._json_body()
+        dest_rel = payload.get("dest", "")
+        if not isinstance(dest_rel, str):
+            dest_rel = ""
+        dest_dir = safe_path(dest_rel)
         if not dest_dir.is_dir():
             raise HTTPError(404, "Destination folder not found")
+        return p, dest_dir
+
+    def ep_move(self, qs: Qs) -> None:
+        p, dest_dir = self._move_copy_target(qs, "move")
         # Can't move a directory into itself or a subdirectory of itself
-        if p.is_dir() and (dest_dir == p or p in dest_dir.parents):
+        if is_link_to_dir(p) and (dest_dir == p or p in dest_dir.parents):
             raise HTTPError(400, "Cannot move a folder into itself or its subfolder")
         dest = dest_dir / p.name
-        if dest.exists():
+        if dest == p:
+            raise HTTPError(400, "The file is already there")
+        if entry_exists(dest):
             raise HTTPError(
                 409, "A file or folder with that name already exists in the destination"
             )
-        shutil.move(str(p), str(dest))
-        self.send_json({"ok": True, "path": rel_of(dest), "name": p.name})
+        with os_errors("Could not move"):
+            shutil.move(str(p), str(dest))
+        sizes_changed(p.parent)
+        sizes_changed(dest_dir)
+        resp = {"ok": True, "path": rel_of(dest), "name": p.name}
+        self.send_json(self.make_hint(resp, dest_dir))
+
+    def ep_copy(self, qs: Qs) -> None:
+        """Copy a file or folder into another folder, server-side.
+
+        Copies never overwrite: on a name clash the same " (1)" numbering the
+        upload path uses is applied, so copying "in place" yields a second
+        entry instead of replacing the first.
+        """
+        p, dest_dir = self._move_copy_target(qs, "copy")
+        if p.is_dir() and (dest_dir == p or p in dest_dir.parents):
+            raise HTTPError(400, "Cannot copy a folder into itself or its subfolder")
+        dest = unique_dest(dest_dir, p.name)
+        with os_errors("Could not copy"):
+            if p.is_dir():
+                shutil.copytree(p, dest, symlinks=True)
+            else:
+                shutil.copy2(p, dest)
+        sizes_changed(dest_dir)
+        resp = {"ok": True, "path": rel_of(dest), "name": dest.name}
+        self.send_json(self.make_hint(resp, dest_dir))
 
     def ep_tree(self, qs: Qs) -> None:
         """Return a minimal folder tree for the move-to picker."""
@@ -1044,27 +1771,43 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"path": rel_of(p), "parent": parent, "dirs": dirs})
 
     def ep_foldersize(self, qs: Qs) -> None:
-        """Compute recursive sizes for a list of directories in one request."""
-        body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPError(400, "Invalid JSON body")
+        """Compute recursive sizes for a list of directories in one request.
+
+        Paths are deduplicated and results cached for a few seconds, and the
+        whole call has a scan budget: without those, one request naming the
+        same big folder 1000 times cost as many walks as it says.
+        """
+        payload = self._json_body()
         paths = payload.get("paths", [])
         if not isinstance(paths, list) or len(paths) > 1000:
             raise HTTPError(400, "Invalid 'paths' payload")
-        sizes = {}
-        for rel in paths:
-            if not isinstance(rel, str):
-                continue
+        sizes: dict[str, int] = {}
+        partial: list[str] = []
+        budget = DIR_SIZE_SCAN_BUDGET
+        for rel in dict.fromkeys(p for p in paths if isinstance(p, str)):
             p = safe_path(rel)
-            if p.is_dir():
-                sizes[rel_of(p)] = dir_size(p)
-        self.send_json({"sizes": sizes})
+            if not p.is_dir():
+                continue
+            key = rel_of(p)
+            cached = DIR_SIZES.get(str(p))
+            if cached is None:
+                total, seen, complete = dir_size(p, budget=max(budget, 1))
+                budget -= seen
+                DIR_SIZES.put(str(p), total, complete)
+            else:
+                total, complete = cached
+            sizes[key] = total
+            if not complete or budget <= 0:
+                partial.append(key)
+        self.send_json({"sizes": sizes, "partial": partial})
 
     def ep_text(self, qs: Qs) -> None:
         p = self._file(qs)
-        size = p.stat().st_size
+        try:
+            st = p.stat()
+        except OSError:
+            raise HTTPError(404, "File not found")
+        size = st.st_size
         if size > MAX_TEXT_SIZE:
             raise HTTPError(
                 413,
@@ -1083,20 +1826,20 @@ class Handler(BaseHTTPRequestHandler):
                 "size": size,
                 "content": content,
                 "newline": detect_newline(raw),
+                # Microseconds, not nanoseconds: the browser must be able to
+                # send this back exactly (JS numbers lose ns precision).
+                "mtime_us": st.st_mtime_ns // 1000,
             }
         )
 
     def ep_save(self, qs: Qs) -> None:
+        self._require_write("Editing files")
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT or p.is_dir():
             raise HTTPError(400, "Target is not a file")
-        body = self._read_body()
-        if not body:
+        payload = self._json_body()
+        if not payload:
             raise HTTPError(400, "Empty request body")
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPError(400, "Invalid JSON body")
         content = payload.get("content")
         if not isinstance(content, str):
             raise HTTPError(400, "Missing 'content' field")
@@ -1114,47 +1857,74 @@ class Handler(BaseHTTPRequestHandler):
             elif newline == "cr":
                 text = text.replace("\n", "\r")
         data = text.encode("utf-8")
-        p.write_bytes(data)
-        make_result = self.maybe_run_make(p.parent)
-        resp = {"ok": True, "size": len(data)}
-        if make_result is not None:
-            resp["make"] = make_result
-        self.send_json(resp)
+        # The editor can hand back the mtime it read; if the file moved on in
+        # the meantime (second tab, an editor outside the browser, a make that
+        # regenerated it) refuse to overwrite it silently.
+        expect = payload.get("if_mtime_us")
+        if expect is not None and not isinstance(expect, int):
+            raise HTTPError(400, "'if_mtime_us' must be a number")
+        tmp = p.with_name(f"{p.name}.saving-{uuid.uuid4().hex[:8]}")
+        with os_errors("Could not save"):
+            if expect is not None:
+                try:
+                    current = p.stat().st_mtime_ns // 1000
+                except FileNotFoundError:
+                    raise HTTPError(409, "The file no longer exists")
+                if current != expect:
+                    raise HTTPError(
+                        409,
+                        "The file changed on disk since you opened it — "
+                        "reload it before saving",
+                    )
+            try:
+                with tmp.open("wb") as fh:
+                    fh.write(data)
+                if entry_exists(p):
+                    # os.replace swaps inodes, so keep the old permissions
+                    # (a +x script must not become 0644 on save).
+                    with contextlib.suppress(OSError):
+                        os.chmod(tmp, stat.S_IMODE(p.stat().st_mode))
+                os.replace(tmp, p)
+                mtime_us = p.stat().st_mtime_ns // 1000
+            finally:
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
+        sizes_changed(p.parent)
+        resp: dict[str, Any] = {"ok": True, "size": len(data), "mtime_us": mtime_us}
+        self.send_json(self.make_hint(resp, p.parent))
 
     def ep_upload(self, qs: Qs) -> None:
+        self._require_write("Uploading")
         dest_dir = safe_path(qs.get("path", [""])[0])
         if not dest_dir.is_dir():
             raise HTTPError(404, "Target folder not found")
         name = os.path.basename(qs.get("filename", [""])[0] or "")
         if not name or name in (".", ".."):
             raise HTTPError(400, "Invalid filename")
-        length = int(self.headers.get("Content-Length", 0) or 0)
         dest = unique_dest(dest_dir, name)
-        size = 0
-        try:
-            with dest.open("wb") as out:
-                remaining = length
-                while remaining > 0:
-                    chunk = self.rfile.read(min(1024 * 1024, remaining))
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    remaining -= len(chunk)
-                    out.write(chunk)
-        except OSError as e:
-            dest.unlink(missing_ok=True)
-            raise HTTPError(500, f"Failed to write file: {e}")
-        make_result = self.maybe_run_make(dest_dir)
-        resp = {"ok": True, "path": rel_of(dest), "name": dest.name, "size": size}
-        if make_result is not None:
-            resp["make"] = make_result
-        self.send_json(resp)
+        with os_errors("Upload failed"):
+            try:
+                # Streams straight to disk and knows chunked bodies: a body
+                # without Content-Length used to arrive as an empty file.
+                size = self._read_body_to_file(dest)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    dest.unlink(missing_ok=True)
+                raise
+        sizes_changed(dest_dir)
+        self.send_json(
+            self.make_hint(
+                {"ok": True, "path": rel_of(dest), "name": dest.name, "size": size},
+                dest_dir,
+            )
+        )
 
     def ep_upload64(self, qs: Qs) -> None:
         """Receive a file as base64 in a JSON body (workaround for flaky
         binary uploads): {"data": "<base64>"}. A data-URL prefix is accepted."""
         if not ENABLE_B64:
             raise HTTPError(403, "Base64 upload is disabled (started with --no-b64)")
+        self._require_write("Uploading")
         dest_dir = safe_path(qs.get("path", [""])[0])
         if not dest_dir.is_dir():
             raise HTTPError(404, "Target folder not found")
@@ -1169,11 +1939,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"(limit {MAX_B64_BODY_SIZE // (1024 * 1024)} MB body) — "
                 f"use the regular upload instead",
             )
-        body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPError(400, "Invalid JSON body")
+        payload = self._json_body(MAX_B64_BODY_SIZE)
         data = payload.get("data")
         if not isinstance(data, str) or not data:
             raise HTTPError(400, "Missing 'data' field (base64 string)")
@@ -1186,15 +1952,15 @@ class Handler(BaseHTTPRequestHandler):
         except (binascii.Error, ValueError):
             raise HTTPError(400, "Invalid base64 payload")
         dest = unique_dest(dest_dir, name)
-        try:
+        with os_errors("Upload failed"):
             dest.write_bytes(raw)
-        except OSError as e:
-            raise HTTPError(500, f"Failed to write file: {e}")
-        make_result = self.maybe_run_make(dest_dir)
-        resp = {"ok": True, "path": rel_of(dest), "name": dest.name, "size": len(raw)}
-        if make_result is not None:
-            resp["make"] = make_result
-        self.send_json(resp)
+        sizes_changed(dest_dir)
+        self.send_json(
+            self.make_hint(
+                {"ok": True, "path": rel_of(dest), "name": dest.name, "size": len(raw)},
+                dest_dir,
+            )
+        )
 
     def ep_download64(self, qs: Qs) -> None:
         """Return a file base64-encoded in a JSON body (workaround for
@@ -1241,40 +2007,47 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(base64.b64encode(chunk))
             self.wfile.write(tail.encode("utf-8"))
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             self.close_connection = True
 
     def ep_extract(self, qs: Qs) -> None:
         """Extract a zip file into a folder (default: its own folder)."""
+        self._require_write("Extracting archives")
         p = safe_path(qs.get("path", [""])[0])
         if not p.is_file():
             raise HTTPError(404, "File not found")
         if p.suffix.lower() != ".zip":
             raise HTTPError(400, "Not a zip file")
-        body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPError(400, "Invalid JSON body")
+        payload = self._json_body()
         dest_rel = payload.get("dest", "")
         if not isinstance(dest_rel, str):
             raise HTTPError(400, "Invalid 'dest' field")
         dest_dir = safe_path(dest_rel) if dest_rel else p.parent
         if not dest_dir.is_dir():
             raise HTTPError(404, "Destination folder not found")
-        result = extract_zip(p, dest_dir)
-        if payload.get("delete"):
-            try:
-                p.unlink()
-            except OSError:
-                pass
-            result["deleted"] = True
-        self.send_json({"ok": True, **result})
+        with os_errors("Extraction failed"):
+            result = extract_zip(p, dest_dir)
+            if payload.get("delete"):
+                try:
+                    p.unlink()
+                    result["deleted"] = True
+                except OSError:
+                    result["deleted"] = False
+        sizes_changed(dest_dir)
+        self.send_json(self.make_hint({"ok": True, **result}, dest_dir))
+
+    def _run_timeout(self, payload: dict[str, Any]) -> int:
+        try:
+            timeout = int(payload.get("timeout", RUN_TIMEOUT))
+        except (TypeError, ValueError):
+            timeout = RUN_TIMEOUT
+        return max(1, min(timeout, RUN_MAX_TIMEOUT))
 
     def ep_run(self, qs: Qs) -> None:
         """Execute an executable file, capturing output (with timeout)."""
         if not ENABLE_RUN:
             raise HTTPError(403, "Executing files is disabled (started with --no-run)")
+        self._require_write("Running files")
         p = safe_path(qs.get("path", [""])[0])
         if p == ROOT:
             raise HTTPError(400, "Cannot run the root directory")
@@ -1282,11 +2055,7 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(404, "Not a file")
         if not is_executable(p):
             raise HTTPError(403, "File is not executable")
-        body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
-        except (ValueError, UnicodeDecodeError):
-            payload = {}
+        payload = self._json_body()
         args_raw = payload.get("args", "")
         if not isinstance(args_raw, str):
             args_raw = ""
@@ -1294,12 +2063,9 @@ class Handler(BaseHTTPRequestHandler):
             args = shlex.split(args_raw)
         except ValueError:
             raise HTTPError(400, "Malformed arguments (unbalanced quotes?)")
-        try:
-            timeout = int(payload.get("timeout", RUN_TIMEOUT))
-        except (TypeError, ValueError):
-            timeout = RUN_TIMEOUT
-        timeout = max(1, min(timeout, RUN_MAX_TIMEOUT))
-        self.send_json(run_executable(p, args, timeout, MAX_RUN_OUTPUT))
+        self.send_json(
+            run_executable(p, args, self._run_timeout(payload), MAX_RUN_OUTPUT)
+        )
 
     def ep_make(self, qs: Qs) -> None:
         """Run make in a folder on demand (header "Make" button).
@@ -1309,11 +2075,8 @@ class Handler(BaseHTTPRequestHandler):
         """
         if not ENABLE_MAKE:
             raise HTTPError(403, "Make is disabled (started with --no-make)")
-        body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
-        except (ValueError, UnicodeDecodeError):
-            payload = {}
+        self._require_write("Running make")
+        payload = self._json_body()
         dir_rel = payload.get("path", "")
         if not isinstance(dir_rel, str):
             dir_rel = ""
@@ -1323,6 +2086,7 @@ class Handler(BaseHTTPRequestHandler):
         result = run_make_if_present(d)
         if result is None:
             raise HTTPError(400, "No Makefile in this folder")
+        sizes_changed(d)
         self.send_json(result)
 
     def ep_make_result(self, qs: Qs) -> None:
@@ -1335,17 +2099,16 @@ class Handler(BaseHTTPRequestHandler):
         if not done:
             self.send_json({"done": False})
         else:
+            if result is not None:
+                sizes_changed(safe_path(result.get("cwd", "")))
             self.send_json({"done": True, "result": result})
 
     def ep_shell(self, qs: Qs) -> None:
         """Run an arbitrary command through the configured shell (bash -c)."""
         if not ENABLE_SHELL:
             raise HTTPError(403, "Shell access is disabled (started with --no-shell)")
-        body = self._read_body()
-        try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPError(400, "Invalid JSON body")
+        self._require_write("Running shell commands")
+        payload = self._json_body()
         command = payload.get("command", "")
         if not isinstance(command, str) or not command.strip():
             raise HTTPError(400, "Empty command")
@@ -1355,14 +2118,10 @@ class Handler(BaseHTTPRequestHandler):
         cwd = safe_path(cwd_rel)
         if not cwd.is_dir():
             raise HTTPError(404, "Working directory not found")
-        try:
-            timeout = int(payload.get("timeout", RUN_TIMEOUT))
-        except (TypeError, ValueError):
-            timeout = RUN_TIMEOUT
-        timeout = max(1, min(timeout, RUN_MAX_TIMEOUT))
         code, timed_out, truncated, text, cwd_out = _run_captured(
-            [SHELL_CMD, "-c", command], cwd, timeout, MAX_RUN_OUTPUT
+            [SHELL_CMD, "-c", command], cwd, self._run_timeout(payload), MAX_RUN_OUTPUT
         )
+        sizes_changed(cwd)
         self.send_json(
             {
                 "code": code,
@@ -1378,16 +2137,20 @@ class Handler(BaseHTTPRequestHandler):
 
         The archive is written straight to the socket (chunked transfer
         encoding): no temp file, and the first bytes reach the client as
-        soon as the first file is compressed.
+        soon as the first file is compressed. Everything is stored under a
+        folder named after the source so unpacking gives one folder instead
+        of a spill of files, and empty folders survive the round trip.
         """
         p = safe_path(qs.get("path", [""])[0])
         if not p.is_dir():
             raise HTTPError(404, "Directory not found")
-        fname = quote(f"{p.name or 'root'}.zip")
+        wrapper = p.name or "root"
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Transfer-Encoding", "chunked")
-        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+        self.send_header(
+            "Content-Disposition", content_disposition("attachment", f"{wrapper}.zip")
+        )
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         count = 0
@@ -1399,24 +2162,28 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     base = Path(dirpath)
                     dirnames[:] = [d for d in dirnames if not (base / d).is_symlink()]
+                    rel_dir = base.relative_to(p).as_posix()
+                    arc_dir = wrapper if rel_dir == "." else f"{wrapper}/{rel_dir}"
+                    if not dirnames and not filenames:
+                        zf.writestr(f"{arc_dir}/", b"")  # keep empty folders
                     for fn in sorted(filenames):
                         fp = base / fn
                         try:
                             if fp.is_symlink() or not fp.is_file():
                                 continue
-                            zf.write(fp, fp.relative_to(p).as_posix())
+                            zf.write(fp, f"{arc_dir}/{fn}")
                             count += 1
                         except OSError:
                             pass
             sink.close()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             self.close_connection = True
             return
         if count == 0:
             self.log_message("zip of %r contained no files", rel_of(p) or "/")
 
-    def ep_thumbnail(self, rel: str) -> None:
-        """Serve a Pillow thumbnail for an image, <= THUMB_SIZE.
+    def ep_thumbnail(self, rel: str, head_only: bool = False) -> None:
+        """Serve a thumbnail for an image, <= THUMB_SIZE.
 
         Rendered thumbnails are kept in a process-local LRU cache keyed by
         (path, mtime, size), so re-browsing a folder is a dict lookup
@@ -1430,53 +2197,31 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(404, "File not found")
         if not stat.S_ISREG(st.st_mode):
             raise HTTPError(404, "File not found")
-        if p.suffix.lower() not in THUMB_EXTS:
+        ext = p.suffix.lower()
+        if ext not in THUMB_EXTS and ext != ".svg":
             raise HTTPError(400, "Not a thumbnailable image")
         key = (p, st.st_mtime_ns, st.st_size)
         cached = THUMB_CACHE.get(key)
         if cached is None:
-            try:
-                from PIL import Image
-            except ImportError:
-                raise HTTPError(501, "Pillow is not installed; thumbnails unavailable")
-            try:
-                with Image.open(p) as im:
-                    im.load()
-                    # Orientation correction for EXIF-rotated photos (JPG/etc.)
-                    try:
-                        from PIL import ImageOps
-
-                        im = ImageOps.exif_transpose(im)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    im.thumbnail(THUMB_SIZE)
-                    want_alpha = (
-                        "A" in im.mode
-                        or im.mode == "P"
-                        or p.suffix.lower() in (".png", ".gif", ".webp", ".ico")
-                    )
-                    buf = io.BytesIO()
-                    if want_alpha:
-                        if im.mode not in ("RGBA", "LA", "P"):
-                            im = im.convert("RGBA")
-                        im.save(buf, "PNG")
-                        fmt = "PNG"
-                    else:
-                        if im.mode not in ("RGB", "L"):
-                            im = im.convert("RGB")
-                        im.save(buf, "JPEG", quality=82)
-                        fmt = "JPEG"
-                    data = buf.getvalue()
-            except Exception:  # noqa: BLE001
-                raise HTTPError(400, "Could not decode image")
+            fmt, data = render_thumbnail(p)
             etag = '"%08x"' % (zlib.crc32(data) & 0xFFFFFFFF)
-            cached = (etag, f"image/{fmt.lower()}", data)
-            THUMB_CACHE.put(key, etag, cached[1], data)
+            ctype = f"image/{fmt}"
+            THUMB_CACHE.put(key, etag, ctype, data)
+            cached = (etag, ctype, data)
         etag, ctype, data = cached
         if (self.headers.get("If-None-Match") or "").strip() == etag:
             self.send_response(304)
             self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if head_only:
+            self._head_only(
+                200,
+                ctype,
+                len(data),
+                {"Cache-Control": "no-cache", "ETag": etag},
+            )
             return
         self._send(200, data, ctype, {"Cache-Control": "no-cache", "ETag": etag})
 
@@ -1603,6 +2348,29 @@ textarea.cmdin{min-height:120px;resize:vertical;white-space:pre;overflow:auto}
 .tree li .tw{width:18px;text-align:center;flex:none;user-select:none}
 .tree li .tn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hint{color:var(--muted);font-size:12px;margin-bottom:10px}
+/* Filter box in the header */
+.filter{font:inherit;font-size:13px;padding:7px 11px;width:180px;border:1px solid var(--border);border-radius:var(--radius);background:var(--input-bg);color:var(--text)}
+.filter:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--focus-ring)}
+.filter::-webkit-search-cancel-button{-webkit-appearance:none}
+/* Read-only badge next to the brand */
+.badge-ro{font-size:11px;font-weight:700;letter-spacing:.4px;color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:2px 8px;text-transform:uppercase}
+/* Selection: checkbox column plus the bulk-action bar above the listing */
+.list td.c-sel,.list th.c-sel{width:34px;padding-right:0;text-align:center}
+.cbx{width:15px;height:15px;margin:0;accent-color:var(--primary);cursor:pointer;vertical-align:middle}
+.list tbody tr.selected td{background:var(--sel-bg)}
+.bulk{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 2px 10px;padding:8px 12px;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);font-size:13px}
+.bulk[hidden]{display:none}
+.bulk b{font-weight:700}
+.bulk .btn{padding:5px 10px;font-size:12px}
+/* Symlink and broken-entry markers in the name column */
+.linkto{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.badge-broken{color:#b45309;font-size:11px;font-weight:700;letter-spacing:.4px}
+html[data-theme="dark"] .badge-broken{color:#ffc861}
+/* Drag-and-drop upload overlay */
+.drop{position:fixed;inset:0;z-index:45;display:flex;align-items:center;justify-content:center;pointer-events:none;background:rgba(63,125,74,.13);box-shadow:inset 0 0 0 4px var(--primary)}
+html[data-theme="dark"] .drop{background:rgba(0,229,255,.09)}
+.drop[hidden]{display:none}
+.drop span{background:var(--panel);border:1px solid var(--primary);color:var(--primary);font-weight:700;padding:14px 22px;border-radius:12px;box-shadow:var(--shadow)}
 
 /* ---- Light theme: summer window desk ---- */
 #scenery{display:none}
@@ -1947,8 +2715,10 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
 </div>
 <header>
   <div class="brand"><span class="brand-icon">🗂️</span>Files</div>
+  <span class="badge-ro" id="roBadge" hidden title="This server was started with --read-only: nothing can be changed">read-only</span>
   <nav class="crumbs" id="crumbs"></nav>
   <div class="spacer"></div>
+  <input class="filter" id="filter" type="search" placeholder="Filter this folder" aria-label="Filter this folder" autocomplete="off" spellcheck="false">
   <button class="btn" id="themeBtn" type="button" title="Toggle light / dark theme" aria-label="Toggle light / dark theme">☼</button>
   <button class="btn" id="makeBtn" type="button" aria-pressed="true" title="Run make automatically after edits, uploads and deletes"><span class="emoji">⚙</span> <span id="makeLabel">Auto-make: on</span></button>
   <button class="btn" id="makeRunBtn" type="button" title="Run make in the current folder"><span class="emoji">🔨</span> Make</button>
@@ -1961,22 +2731,23 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
       <button class="menu-item" id="newFile" role="menuitem"><span class="icon">📄</span>New text file</button>
     </div>
   </div>
-  <label class="btn btn-primary">Upload<input type="file" id="files" multiple hidden></label>
+  <label class="btn btn-primary" id="uploadBtn" title="Upload files into the current folder">Upload<input type="file" id="files" multiple hidden></label>
   <label class="btn" id="upload64Btn" title="Upload as base64 (workaround for network problems)">Upload b64<input type="file" id="files64" multiple hidden></label>
 </header>
 <main>
   <div class="meta" id="meta"></div>
+  <div class="bulk" id="bulk" hidden></div>
   <div class="list-wrap">
     <div class="row-hl" aria-hidden="true"></div>
     <table class="list">
       <thead>
         <tr>
+          <th class="c-sel"><input type="checkbox" class="cbx" id="selAll" title="Select everything in this folder" aria-label="Select everything in this folder"></th>
           <th class="sortable" data-sort="name">Name<span class="si"></span></th>
           <th class="c-size sortable" data-sort="size">Size<span class="si"></span></th>
           <th class="c-created sortable" data-sort="ctime">Created<span class="si"></span></th>
           <th class="c-mtime sortable" data-sort="mtime">Last updated<span class="si"></span></th>
-          <th class="c-acts">Actions</th>
-        </tr>
+          <th class="c-acts">Actions</th>        </tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -1995,10 +2766,12 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
 </div>
 
 <div class="toast" id="toast"></div>
+<div class="drop" id="drop" hidden><span>Drop files to upload them here</span></div>
 
 <script>
 const ROOT_NAME = __ROOT_NAME__;
-const FEATURES = __FEATURES__;  // {shell, run, make, b64} — set by the server at startup
+const FEATURES = __FEATURES__;  // {shell, run, make, b64, write} — set by the server at startup
+const MAKE_POLL_MS = __MAKE_POLL_MS__;  // how often a background make job is polled
 const $ = s => document.querySelector(s);
 const rows = $("#rows"), crumbs = $("#crumbs");
 
@@ -2022,12 +2795,18 @@ const rows = $("#rows"), crumbs = $("#crumbs");
   }
 }
 const state = { path: "", parent: null, entries: [], sizes: {}, sizesLoaded: false,
-                sort: { key: "name", dir: 1 } };
+                sort: { key: "name", dir: 1 }, total: 0, truncated: false,
+                filter: "", sel: new Set() };
+let dirty = false;      // editor has unsaved changes (see beforeunload)
+let uploadBusy = false; // an upload is running (see beforeunload)
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function fmtSize(n){ if(n==null) return ""; if(n===0) return "0 B"; const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024 && i<u.length-1){n/=1024;i++;} return n.toFixed(n>=10||i===0?0:1)+" "+u[i]; }
 function fmtDate(ts){ const d=new Date(ts*1000), p=x=>String(x).padStart(2,"0"); return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes()); }
-function dirname(p){ if(!p) return ROOT_NAME; const i=p.lastIndexOf("/"); const base=i<0?p:p.slice(0,i); return base===""?ROOT_NAME:base; }
+// Folder part of a path: "" means the root. The old version returned the file
+// name for a path without a slash, which made "Extract into" default to a file.
+function dirname(p){ const i=String(p||"").lastIndexOf("/"); return i<0 ? "" : p.slice(0,i); }
+function dirLabel(p){ const d=dirname(p); return d==="" ? ROOT_NAME : d; }
 
 const MAKE_KEY = "fm-auto-make";
 // Auto-make preference: "0" in localStorage disables it; absent means on.
@@ -2045,7 +2824,11 @@ function api(path, opts){
   return fetch(path, opts).then(async r=>{
     let data=null;
     if((r.headers.get("content-type")||"").includes("json")){ try{ data=await r.json(); }catch(e){} }
-    if(!r.ok) throw new Error((data&&data.error) || (r.status+" "+r.statusText));
+    if(!r.ok){
+      const err = new Error((data&&data.error) || (r.status+" "+r.statusText));
+      err.status = r.status;  // callers distinguish 404 (expired job) from 409 (conflict)
+      throw err;
+    }
     return data;
   });
 }
@@ -2056,31 +2839,70 @@ function toast(msg, isErr){
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove("show"), 3500);
 }
 
+let modalQueue=[];  // finished background make runs waiting for the modal to be free
 function openModal(title, html){ $("#modalTitle").textContent=title; $("#modalBody").innerHTML=html; $("#overlay").hidden=false; }
-function closeModal(){ $("#overlay").hidden=true; $("#modalBody").innerHTML=""; }
-$("#modalClose").onclick=closeModal;
+function closeModal(force){
+  // Losing typed text to a stray Escape is the one way this tool can eat work.
+  if(!force && dirty && !confirm("Discard your unsaved changes?")) return;
+  dirty=false;
+  $("#overlay").hidden=true; $("#modalBody").innerHTML="";
+  const next=modalQueue.shift();
+  if(next) showMakeResult(next.title, next.runs);
+}
+$("#modalClose").onclick=()=>closeModal();
 $("#overlay").addEventListener("mousedown", e=>{ if(e.target===$("#overlay")) closeModal(); });
 document.addEventListener("keydown", e=>{ if(e.key==="Escape") closeModal(); });
+window.addEventListener("beforeunload", e=>{
+  if(dirty || uploadBusy){ e.preventDefault(); e.returnValue=""; }
+});
 
 // -- loading / listing -------------------------------------------------------
+// The current folder lives in the URL hash, so the back button, reloads and
+// pasted links all work; the server never sees a hash, so it stays stateless.
+function pathFromHash(){
+  const raw=(location.hash||"").replace(/^#\/?/, "");
+  if(!raw) return "";
+  try { return decodeURIComponent(raw); } catch(e) { return raw; }
+}
+function setHash(path){
+  const want = "#/" + String(path||"").split("/").filter(Boolean).map(encodeURIComponent).join("/");
+  if(location.hash !== want) location.hash = want;  // adds a history entry
+}
+window.addEventListener("hashchange", ()=>{
+  const p = pathFromHash();
+  if(p !== state.path) load(p);
+});
+
+let loadSeq = 0;  // guards against a slow listing overwriting a newer one
 function load(path){
   state.path = path || "";
   state.sizes = {}; state.sizesLoaded = false;
+  state.sel.clear(); state.filter="";
+  const f=$("#filter"); if(f) f.value="";
+  setHash(state.path);
   updateCrumbs();
+  render();  // show the loading state for the new folder right away
+  const seq=++loadSeq;
   api("api/list?path="+encodeURIComponent(state.path)).then(d=>{
+    if(seq!==loadSeq) return;  // superseded by a newer click
     state.entries=d.entries; state.parent=d.parent;
+    state.total=d.total; state.truncated=!!d.truncated;
     document.title = (state.path? state.path+"/" : "") + ROOT_NAME + " · Files";
     render();
-    loadFolderSizes();
-  }).catch(err=>toast(err.message, true));
+    loadFolderSizes(seq);
+  }).catch(err=>{ if(seq===loadSeq) toast(err.message, true); });
 }
 
 function sizeOf(e){ return e.kind==="dir" ? (state.sizes[e.path] ?? -1) : (e.size ?? 0); }
 
 function sortedEntries(){
   const {key, dir} = state.sort;
-  const dirs = state.entries.filter(e=>e.kind==="dir");
-  const files = state.entries.filter(e=>e.kind!=="dir");
+  const needle = state.filter.trim().toLowerCase();
+  const list = needle
+    ? state.entries.filter(e=>e.name.toLowerCase().includes(needle))
+    : state.entries;
+  const dirs = list.filter(e=>e.kind==="dir");
+  const files = list.filter(e=>e.kind!=="dir");
   const cmp = {
     name:  (a,b)=>a.name.localeCompare(b.name, undefined, {sensitivity:"base"}),
     size:  (a,b)=>sizeOf(a)-sizeOf(b),
@@ -2093,13 +2915,33 @@ function sortedEntries(){
 }
 
 function render(){
-  const e=state.entries;
+  const shown=sortedEntries();
   rows.innerHTML="";
-  $("#empty").hidden = e.length>0;
-  const dirs=e.filter(x=>x.kind==="dir").length, files=e.length-dirs;
-  $("#meta").textContent = e.length ? dirs+" folder"+(dirs!==1?"s":"")+", "+files+" file"+(files!==1?"s":"") : "";
+  const dirsAll=state.entries.filter(x=>x.kind==="dir").length;
+  const filesAll=state.entries.length-dirsAll;
+  let meta = state.entries.length
+    ? dirsAll+" folder"+(dirsAll!==1?"s":"")+", "+filesAll+" file"+(filesAll!==1?"s":"")
+    : "";
+  if(state.truncated){
+    // The server capped the listing; say so instead of implying this is all.
+    meta += " · showing the first "+state.entries.length+" of "+state.total+" entries";
+  } else if(state.filter){
+    meta += " · "+shown.length+" of "+state.entries.length+" match “"+state.filter+"”";
+  }
+  $("#meta").textContent = meta;
+  $("#empty").hidden = shown.length>0 || !state.entries.length;
+  $("#empty").textContent = state.entries.length
+    ? "Nothing here matches “"+state.filter+"”."
+    : "This folder is empty.";
   if(state.path) rows.appendChild(trUp());
-  sortedEntries().forEach(x=>rows.appendChild(trEntry(x)));
+  shown.forEach(x=>rows.appendChild(trEntry(x)));
+  renderBulk();
+  const all=$("#selAll");
+  if(all){
+    const paths=state.entries.map(e=>e.path);
+    all.checked = paths.length>0 && paths.every(p=>state.sel.has(p));
+    all.disabled = paths.length===0;
+  }
 }
 
 function updateCrumbs(){
@@ -2118,13 +2960,17 @@ function updateCrumbs(){
 }
 
 // -- folder sizes (recursive, one batch request) ----------------------------
-function loadFolderSizes(){
-  const dirPaths = state.entries.filter(e=>e.kind==="dir").map(e=>e.path);
+function loadFolderSizes(seq){
+  const dirPaths = [...new Set(state.entries.filter(e=>e.kind==="dir").map(e=>e.path))];
   if(dirPaths.length===0){ state.sizesLoaded=true; return; }
+  const mine = seq===undefined || seq===loadSeq;
   api("api/foldersize", { method:"POST", headers:{"Content-Type":"application/json"},
                           body: JSON.stringify({paths: dirPaths}) })
-    .then(d=>{ state.sizes=d.sizes||{}; state.sizesLoaded=true; render(); updateSortIndicators(); })
-    .catch(()=>{ state.sizesLoaded=true; });
+    .then(d=>{
+      if(!mine) return;
+      state.sizes=d.sizes||{}; state.sizesLoaded=true; render(); updateSortIndicators();
+    })
+    .catch(()=>{ if(mine) state.sizesLoaded=true; });
 }
 
 // -- sorting ----------------------------------------------------------------
@@ -2149,7 +2995,7 @@ document.querySelectorAll("th.sortable").forEach(th=>{
 // -- rows -------------------------------------------------------------------
 function trUp(){
   const tr=document.createElement("tr"); tr.className="row up";
-  tr.innerHTML='<td class="name"><span class="nm"><span class="icon">📂</span><span>..</span></span></td><td class="size"></td><td class="mtime"></td><td class="mtime"></td><td class="acts"></td>';
+  tr.innerHTML='<td class="c-sel"></td><td class="name"><span class="nm"><span class="icon">📂</span><span>..</span></span></td><td class="size"></td><td class="mtime"></td><td class="mtime"></td><td class="acts"></td>';
   tr.onclick=()=>{ if(state.parent!==null && state.parent!==undefined) load(state.parent); };
   return tr;
 }
@@ -2161,6 +3007,14 @@ function iconHTML(e){
     : '<span class="icon">🖼️</span>';
   if(e.kind==="text") return '<span class="icon">📄</span>';
   return '<span class="icon">🗎</span>';
+}
+
+// Symlinks are shown as the entry they are, so say what they point at: it is
+// the link that delete/rename/move act on, not its target.
+function markHTML(e){
+  if(e.broken) return ' <span class="badge-broken" title="This symbolic link points at nothing">broken</span>';
+  if(e.link) return ' <span class="linkto" title="Symbolic link to '+esc(e.link)+'">↗ '+esc(e.link)+'</span>';
+  return "";
 }
 
 function sizeCell(e){
@@ -2176,10 +3030,13 @@ function actionsHTML(e){
     h+='<button class="act" data-id="open" title="Open folder">📂</button>';
     h+='<button class="act" data-id="zip" title="Download as zip">📦</button>';
   }
-  h+='<button class="act" data-id="rename" title="Rename">✏️</button>';
-  h+='<button class="act" data-id="move" title="Move to…">🚚</button>';
+  if(FEATURES.write){
+    h+='<button class="act" data-id="rename" title="Rename">✏️</button>';
+    h+='<button class="act" data-id="move" title="Move to…">🚚</button>';
+    h+='<button class="act" data-id="copy" title="Copy to…">📋</button>';
+  }
   if(e.kind!=="dir"){
-    if(e.name.toLowerCase().endsWith(".zip")) h+='<button class="act" data-id="extract" title="Extract zip">🗜️</button>';
+    if(FEATURES.write && e.name.toLowerCase().endsWith(".zip")) h+='<button class="act" data-id="extract" title="Extract zip">🗜️</button>';
     if(e.run) h+='<button class="act" data-id="run" title="Run">▶</button>';
     const vi = e.kind==="text" ? "✎" : "👁";
     const vt = e.kind==="text" ? "Edit" : "View";
@@ -2187,26 +3044,97 @@ function actionsHTML(e){
     h+='<button class="act" data-id="dl" title="Download">⬇</button>';
     if(FEATURES.b64) h+='<button class="act" data-id="dlb64" title="Download as base64 (workaround for network problems)">🔣</button>';
   }
-  h+='<button class="act" data-id="del" title="Delete">🗑</button>';
+  if(FEATURES.write) h+='<button class="act" data-id="del" title="Delete">🗑</button>';
   return h;
 }
 
 function trEntry(e){
   const tr=document.createElement("tr"); tr.className="row";
   const isDir=e.kind==="dir";
-  tr.innerHTML=
-    '<td class="name"><span class="nm">'+iconHTML(e)+'<span>'+esc(e.name)+'</span></span></td>'+
+  if(state.sel.has(e.path)) tr.classList.add("selected");
+  const cb = FEATURES.write
+    ? '<td class="c-sel"><input type="checkbox" class="cbx" aria-label="Select '+esc(e.name)+'"'+(state.sel.has(e.path)?" checked":"")+'></td>'
+    : '<td class="c-sel"></td>';
+  tr.innerHTML=cb+
+    '<td class="name"><span class="nm">'+iconHTML(e)+'<span>'+esc(e.name)+'</span></span>'+markHTML(e)+'</td>'+
     '<td class="size">'+sizeCell(e)+'</td>'+
     '<td class="mtime">'+fmtDate(e.ctime)+'</td>'+
     '<td class="mtime">'+fmtDate(e.mtime)+'</td>'+
     '<td class="acts">'+actionsHTML(e)+'</td>';
   tr.onclick=()=>{ isDir ? load(e.path) : openFile(e); };
+  const box=tr.querySelector(".cbx");
+  if(box){
+    box.onclick=ev=>{ ev.stopPropagation(); setSel(e.path, box.checked, tr); };
+  }
   tr.querySelectorAll(".act").forEach(b=>{
     b.onclick=ev=>{ ev.stopPropagation(); ACTION_MAP[b.dataset.id](e); };
   });
   return tr;
 }
-const ACTION_MAP={ open:e=>load(e.path), view:e=>openFile(e), dl:e=>download(e), del:e=>del(e), rename:e=>renameItem(e), move:e=>moveItem(e), extract:e=>extractZip(e), zip:e=>zipDir(e.path), dlb64:e=>downloadB64(e), run:e=>runFile(e) };
+const ACTION_MAP={ open:e=>load(e.path), view:e=>openFile(e), dl:e=>download(e), del:e=>del(e), rename:e=>renameItem(e), move:e=>moveItem(e), copy:e=>copyItem(e), extract:e=>extractZip(e), zip:e=>zipDir(e.path), dlb64:e=>downloadB64(e), run:e=>runFile(e) };
+
+// -- multi-select ------------------------------------------------------------
+function setSel(path, on, tr){
+  if(on) state.sel.add(path); else state.sel.delete(path);
+  if(tr) tr.classList.toggle("selected", on);
+  renderBulk();
+  const all=$("#selAll");
+  if(all){
+    const paths=state.entries.map(e=>e.path);
+    all.checked = paths.length>0 && paths.every(p=>state.sel.has(p));
+  }
+}
+$("#selAll").onchange=function(){
+  const paths=state.entries.map(e=>e.path);
+  if(this.checked) paths.forEach(p=>state.sel.add(p));
+  else paths.forEach(p=>state.sel.delete(p));
+  render();
+};
+
+// Everything selected at once runs one request per entry: this tool has no
+// batch endpoint, and the folders it deals with are small enough for that.
+function bulkEach(kind, dest, verb){
+  const paths=[...state.sel];
+  if(!paths.length) return;
+  const jobs=[];
+  const step=i=>{
+    if(i>=paths.length){
+      state.sel.clear();
+      closeModal();
+      load(state.path);
+      toast(verb+" "+paths.length+" item"+(paths.length===1?"":"s"));
+      if(jobs.length) pollMakeJobs("after "+verb.toLowerCase()+"ing the selection", jobs);
+      return;
+    }
+    const q="?path="+encodeURIComponent(paths[i]);
+    const opts = kind==="delete" ? {method:"POST"}
+      : { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({dest}) };
+    api("api/"+kind+q, opts)
+      .then(d=>{ if(d && d.make) jobs.push({file:paths[i], job:d.make.job}); })
+      .catch(err=>toast(paths[i]+": "+err.message, true))
+      .then(()=>step(i+1));
+  };
+  step(0);
+}
+
+function renderBulk(){
+  const bar=$("#bulk"), n=state.sel.size;
+  if(!n || !FEATURES.write){ bar.hidden=true; bar.innerHTML=""; return; }
+  bar.hidden=false;
+  bar.innerHTML='<b>'+n+' selected</b>'+
+    '<button class="btn" id="bulkMove">🚚 Move…</button>'+
+    '<button class="btn" id="bulkCopy">📋 Copy…</button>'+
+    '<button class="btn" id="bulkDel">🗑 Delete</button>'+
+    '<div class="spacer"></div>'+
+    '<button class="btn" id="bulkNone">Clear selection</button>';
+  $("#bulkMove").onclick=()=>pickFolder("Move "+n+" items", "Move", "", false, dest=>bulkEach("move", dest, "Moved"));
+  $("#bulkCopy").onclick=()=>pickFolder("Copy "+n+" items", "Copy", "", false, dest=>bulkEach("copy", dest, "Copied"));
+  $("#bulkDel").onclick=()=>{
+    if(!confirm("Delete the "+n+" selected item"+(n===1?"":"s")+"?")) return;
+    bulkEach("delete", "", "Deleted");
+  };
+  $("#bulkNone").onclick=()=>{ state.sel.clear(); render(); };
+}
 
 function openFile(e){
   if(e.kind==="image") viewImage(e);
@@ -2246,6 +3174,7 @@ function editText(e){
   openModal("Editing — "+e.name, '<div class="loading">Loading…</div>');
   api("api/text?path="+q).then(d=>{
     const origNL=d.newline||"none";
+    let mtimeUs=d.mtime_us;  // what the server says the file is; a save must match it
     $("#modalTitle").textContent="Editing — "+e.name;
     $("#modalBody").innerHTML=
       '<div class="editor-info">'+fmtSize(d.size)+' · Line endings: <b>'+esc(NL_LABEL[origNL]||origNL)+'</b>'+
@@ -2254,13 +3183,22 @@ function editText(e){
       '<option value="lf">Change to LF (Unix)</option>'+
       '<option value="crlf">Change to CRLF (Windows)</option>'+
       '<option value="cr">Change to CR (Classic Mac)</option>'+
-      '</select></div>'+
-      '<textarea id="editor" spellcheck="false"></textarea>'+
-      '<div class="modal-actions"><button class="btn btn-primary" id="saveBtn">Save</button><button class="btn" onclick="closeModal()">Close</button></div>';
+      '</select>'+
+      (FEATURES.write?' · <b>Ctrl/Cmd+S</b> saves':'</div>')+'</div>'+
+      '<textarea id="editor" spellcheck="false"'+(FEATURES.write?'':' readonly')+'></textarea>'+
+      '<div class="modal-actions">'+(FEATURES.write?'<button class="btn btn-primary" id="saveBtn">Save</button>':'')+'<button class="btn" onclick="closeModal()">Close</button></div>';
     const ta=$("#editor"); ta.value=d.content;
     const sel=$("#nlSel");
     sel.options[0].textContent="Keep as-is ("+(NL_LABEL[origNL]||origNL)+")";
-    $("#saveBtn").onclick=()=>saveText(e, ta, sel.value, origNL);
+    const save=$("#saveBtn");
+    const doSave=()=>{ if(save) save.disabled=true; saveText(e, ta, sel.value, origNL, mtimeUs, d=>{ mtimeUs=d; if(save) save.disabled=false; }); };
+    if(save) save.onclick=doSave;
+    ta.addEventListener("input", ()=>{ dirty=true; });
+    ta.addEventListener("keydown", ev=>{
+      if((ev.ctrlKey||ev.metaKey) && ev.key.toLowerCase()==="s" && FEATURES.write){
+        ev.preventDefault(); doSave();
+      }
+    });
     ta.focus();
   }).catch(err=>{
     openModal(e.name,
@@ -2270,23 +3208,36 @@ function editText(e){
   });
 }
 
-function saveText(e, ta, sel, origNL){
+function saveText(e, ta, sel, origNL, ifMtime, onSaved){
   // The browser textarea normalizes line endings to \n, so "keep" means
   // re-applying the file's original line ending on the server (when it had
   // a single consistent one; "mixed"/"none" are saved as typed).
   const nl = sel==="keep" ? (["lf","crlf","cr"].includes(origNL) ? origNL : "as-is") : sel;
-  api("api/save?path="+encodeURIComponent(e.path), { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({content: ta.value, newline: nl}) })
+  const body = { content: ta.value, newline: nl };
+  if(ifMtime != null) body.if_mtime_us = ifMtime;  // refuse to clobber an outside edit
+  api("api/save?path="+encodeURIComponent(e.path), { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) })
     .then(d=>{
+      dirty=false;                 // the buffer matches the file again
+      if(onSaved) onSaved(d.mtime_us);
       toast("Saved "+e.name);
-      closeModal(); load(state.path);
+      load(state.path);            // keep editing: the modal stays open
       if(d.make) pollMakeJobs("after saving "+e.name, [{file:e.name, job:d.make.job}]);
     })
-    .catch(err=>toast(err.message, true));
+    .catch(err=>{
+      if(err.status===409){
+        // The file moved on underneath us (second tab, a make, an outside
+        // editor). Say so and offer to reload instead of overwriting it.
+        if(confirm(err.message+"\n\nReload the version on disk? Choosing Cancel keeps your current edits.")) editText(e);
+      } else {
+        toast(err.message, true);
+      }
+    });
 }
 
 function del(e){
   const what=e.kind==="dir"?"folder":"file";
-  const suffix=e.kind==="dir"?" (and everything inside it)":"";
+  let suffix=e.kind==="dir"?" (and everything inside it)":"";
+  if(e.link) suffix=" — this is a symbolic link, so only the link is deleted";
   if(!confirm('Delete '+what+' "'+e.name+'"?'+suffix)) return;
   api("api/delete?path="+encodeURIComponent(e.path), {method:"POST"})
     .then(d=>{
@@ -2334,12 +3285,12 @@ function extractZip(e){
   const inp=$("#exDest"); inp.focus();
   const doEx=()=>{
     const dest=inp.value.trim();
-    const del=$("#exDelete").checked;
+    const delZip=$("#exDelete").checked;
     const resEl=$("#exResult");
     resEl.innerHTML='<div class="loading" style="padding:16px 0">Extracting…</div>';
     api("api/extract?path="+q,
         { method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({ dest, delete: del }) })
+          body: JSON.stringify({ dest, delete: delZip }) })
       .then(d=>{
         let extra=d.entries+" file"+(d.entries===1?"":"s")+" · "+fmtSize(d.bytes)+(d.deleted?" · zip deleted":"");
         resEl.innerHTML=
@@ -2380,8 +3331,11 @@ function renderRunResult(d, resEl){
 }
 
 // -- Automatic make results (after edit/upload in a dir with a Makefile) ----
+// A build can finish while another dialog is open (the editor, an upload), and
+// overwriting that dialog lost the output, so finished builds queue up and are
+// shown one at a time as soon as the modal is free again.
 function makeModal(title, runs){
-  openModal("make — "+esc(title),
+  openModal("make — "+title,
     runs.map(r=>{
       const d=r.res;
       const cls=d.timed_out?"warn":(d.code===0?"ok":"err");
@@ -2395,7 +3349,16 @@ function makeModal(title, runs){
         '<span class="editor-info" style="margin:0">'+extra.join(" · ")+'</span></div>'+
         '<pre class="runout">'+esc(d.output||"(no output)")+'</pre>';
     }).join("")+
-    '<div class="modal-actions"><button class="btn btn-primary" onclick="closeModal()">Close</button></div>');
+    '<div class="modal-actions"><button class="btn btn-primary" onclick="closeModal(true)">Close</button></div>');
+}
+function showMakeResult(title, runs){
+  if(!runs || !runs.length) return;
+  if(!$("#overlay").hidden){
+    modalQueue.push({title, runs});
+    toast("make finished — its output is queued behind this dialog");
+    return;
+  }
+  makeModal(title, runs);
 }
 
 // Auto-make runs in the server's background: poll each job until it reports
@@ -2406,22 +3369,23 @@ function pollMakeJobs(title, jobs){
   (function poll(){
     const pending=jobs.filter(j=>result[j.job]===undefined);
     if(!pending.length){
-      const runs=jobs.map(j=>({file:j.file, res:result[j.job]})).filter(r=>r.res);
-      if(runs.length) makeModal(title, runs);
+      showMakeResult(title, jobs.map(j=>({file:j.file, res:result[j.job]})).filter(r=>r.res));
       return;
     }
     if(Date.now()-t0>10*60*1000){ toast("Make results expired", true); return; }
     Promise.all(pending.map(j=>api("api/make/result?job="+j.job)
         .then(d=>{ if(d.done) result[j.job]=d.result; })
-        .catch(err=>{ if(String(err.message).startsWith("404")) result[j.job]=null; })))
-      .then(()=>setTimeout(poll, 400));
+        // An expired job never reports anything, so stop asking about it. The
+        // status is on the error, not in its message.
+        .catch(err=>{ if(err.status===404) result[j.job]=null; })))
+      .then(()=>setTimeout(poll, MAKE_POLL_MS));
   })();
 }
 
 // -- Run executable file ----------------------------------------------------
 function runFile(e){
   openModal("Run — "+e.name,
-    '<div class="hint">Runs <b>'+esc(e.name)+'</b> in <b>'+esc(dirname(e.path))+'</b> using the current user’s environment.</div>'+
+    '<div class="hint">Runs <b>'+esc(e.name)+'</b> in <b>'+esc(dirLabel(e.path))+'</b> using the current user’s environment.</div>'+
     '<div class="field"><label>Arguments (optional, quote multi-word values)</label><input id="runArgs" placeholder="--flag 42  input.txt" autocomplete="off" spellcheck="false"></div>'+
     '<div class="field narrow" style="margin-top:12px"><label>Timeout (seconds)</label><input id="runTimeout" type="number" min="1" max="3600" step="1" value="60"></div>'+
     '<div id="runResult"></div>'+
@@ -2531,19 +3495,21 @@ function doRename(e, inp){
     .catch(err=>toast(err.message, true));
 }
 
-// -- Move (with folder tree picker) --
-let moveSelPath=null;
-function moveItem(e){
-  moveSelPath=e.path;
-  const isDir=e.kind==="dir";
-  openModal("Move "+(isDir?"folder":"file")+" — "+e.name,
+// -- Move / Copy (shared folder tree picker) ---------------------------------
+// One picker for moving, copying and the bulk actions: it hands the chosen
+// destination folder to a callback instead of owning the action itself.
+let pickCb=null, pickVerb="Move", pickExcl="", pickExclDir=false;
+function pickFolder(title, verb, excludePath, excludeIsDir, onPick){
+  pickCb=onPick; pickVerb=verb; pickExcl=excludePath||""; pickExclDir=!!excludeIsDir;
+  openModal(title,
     '<div class="hint">Select a destination folder:</div>'+
     '<div id="moveTree"></div>'+
-    '<div class="modal-actions"><button class="btn btn-primary" id="moveOk" disabled>Move here</button><button class="btn" onclick="closeModal()">Cancel</button></div>');
-  loadMoveTree("", e.path, isDir);
+    '<div class="modal-actions"><button class="btn btn-primary" id="pickOk" disabled>'+esc(pickVerb)+' here</button><button class="btn" onclick="closeModal()">Cancel</button></div>');
+  loadMoveTree("");
 }
+function pickExcluded(p){ return p===pickExcl || (pickExclDir && p.startsWith(pickExcl+"/")); }
 
-function loadMoveTree(dirPath, excludePath, excludeIsDir){
+function loadMoveTree(dirPath){
   api("api/tree?path="+encodeURIComponent(dirPath)).then(d=>{
     const ul=document.createElement("ul");
     ul.className="tree";
@@ -2553,8 +3519,7 @@ function loadMoveTree(dirPath, excludePath, excludeIsDir){
     rootLi.onclick=()=>selectMoveDir(rootLi, "");
     ul.appendChild(rootLi);
     d.dirs.forEach(dir=>{
-      if(dir.path===excludePath) return;
-      if(excludeIsDir && dir.path.startsWith(excludePath+"/")) return;
+      if(pickExcluded(dir.path)) return;
       const li=document.createElement("li");
       li.innerHTML='<span class="tw">📁</span><span class="tn">'+esc(dir.name)+'</span>';
       li.dataset.path=dir.path;
@@ -2579,12 +3544,11 @@ function loadMoveTree(dirPath, excludePath, excludeIsDir){
         if(dd.parent!==null){
           const pLi=document.createElement("li");
           pLi.innerHTML='<span class="tw">⬆</span><span class="tn">..</span>';
-          pLi.onclick=()=>{ browseDir=dd.parent; loadMoveTree(dirPath, excludePath, excludeIsDir); };
+          pLi.onclick=()=>{ browseDir=dd.parent; loadMoveTree(""); };
           sUl.appendChild(pLi);
         }
         dd.dirs.forEach(dir2=>{
-          if(dir2.path===excludePath) return;
-          if(excludeIsDir && dir2.path.startsWith(excludePath+"/")) return;
+          if(pickExcluded(dir2.path)) return;
           const li2=document.createElement("li");
           li2.innerHTML='<span class="tw">📁</span><span class="tn">'+esc(dir2.name)+'</span>';
           li2.onclick=()=>selectMoveDir(li2, dir2.path);
@@ -2594,27 +3558,43 @@ function loadMoveTree(dirPath, excludePath, excludeIsDir){
         const useBtn=document.createElement("button");
         useBtn.className="btn btn-primary";
         useBtn.style.cssText="margin-top:8px;font-size:12px;padding:5px 12px";
-        useBtn.textContent="Move to here";
-        useBtn.onclick=()=>doMove(moveSelPath, browseDir);
+        useBtn.textContent=pickVerb+" to here";
+        useBtn.onclick=()=>pickCb(browseDir);
         frag.appendChild(useBtn);
         subBtn.parentElement.insertBefore(frag, subBtn.parentElement.querySelector(".modal-actions"));
       });
     };
     container.appendChild(subBtn);
-    $("#moveOk").disabled=true;
+    $("#pickOk").disabled=true;
   });
 }
 
 function selectMoveDir(li, path){
   document.querySelectorAll("#moveTree .tree li.selected").forEach(x=>x.classList.remove("selected"));
   li.classList.add("selected");
-  $("#moveOk").disabled=false;
-  $("#moveOk").onclick=()=>doMove(moveSelPath, path);
+  $("#pickOk").disabled=false;
+  $("#pickOk").onclick=()=>pickCb(path);
 }
 
-function doMove(srcPath, destDir){
-  api("api/move?path="+encodeURIComponent(srcPath), { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({dest: destDir}) })
-    .then(()=>{ toast("Moved successfully"); closeModal(); load(state.path); })
+function moveItem(e){
+  const isDir=e.kind==="dir";
+  pickFolder("Move "+(isDir?"folder":"file")+" — "+e.name, "Move", e.path, isDir,
+             dest=>transfer("move", e, dest));
+}
+function copyItem(e){
+  const isDir=e.kind==="dir";
+  pickFolder("Copy "+(isDir?"folder":"file")+" — "+e.name, "Copy", e.path, isDir,
+             dest=>transfer("copy", e, dest));
+}
+function transfer(kind, e, dest){
+  api("api/"+kind+"?path="+encodeURIComponent(e.path),
+      { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({dest}) })
+    .then(d=>{
+      closeModal();
+      toast(kind==="move" ? "Moved "+e.name : "Copied "+e.name+" into "+(dest||ROOT_NAME));
+      load(state.path);
+      if(d.make) pollMakeJobs("after "+(kind==="move"?"moving":"copying")+" "+e.name, [{file:e.name, job:d.make.job}]);
+    })
     .catch(err=>toast(err.message, true));
 }
 
@@ -2674,32 +3654,112 @@ function doNewFile(inp){
     .catch(err=>toast(err.message, true));
 }
 
+// -- Uploads -----------------------------------------------------------------
+const UPLOAD_PARALLEL = 3;  // uploads in flight at once
 $("#files").addEventListener("change", function(){
   const files=[...this.files]; this.value="";
-  if(files.length) uploadAll(files, 0, []);
+  if(files.length) uploadAll(files);
 });
-function uploadAll(files, i, results, makeRuns){
-  if(!makeRuns) makeRuns=[];
-  if(i>=files.length){
-    toast("Upload complete");
-    closeModal(); load(state.path);
+
+function folderLabel(rel){ return rel ? rel : ROOT_NAME; }
+
+// Uploads go to the folder that was open when they started: browsing around
+// while a big batch runs must not send the rest of it somewhere else.
+function uploadAll(files, target){
+  target = target == null ? state.path : target;
+  uploadBusy = true;
+  const totalBytes=files.reduce((n,f)=>n+f.size,0);
+  const results=[], makeRuns=[], failed=[];
+  let i=0, active=0, sent=0, done=0;
+  openModal("Uploading to "+folderLabel(target),
+    '<div class="up-name" id="upName"></div>'+
+    '<div class="bar"><div class="bar-fill" id="barFill"></div></div>'+
+    '<div class="up-count" id="upCount"></div>');
+  const paint=()=>{
+    const fill=$("#barFill"); if(fill) fill.style.width=(totalBytes?100*sent/totalBytes:100).toFixed(1)+"%";
+    const cnt=$("#upCount"); if(cnt) cnt.textContent=done+" / "+files.length+" files · "+fmtSize(sent)+" of "+fmtSize(totalBytes);
+    const nm=$("#upName"); if(nm) nm.textContent=files.length+" file"+(files.length===1?"":"s")+" → "+folderLabel(target);
+  };
+  paint();
+  const finish=()=>{
+    uploadBusy=false;
+    closeModal(true);
+    load(state.path);
+    if(failed.length) toast("Failed: "+failed.join(", "), true);
+    else toast("Uploaded "+files.length+" file"+(files.length===1?"":"s")+" to "+folderLabel(target));
     if(makeRuns.length) pollMakeJobs("after upload", makeRuns);
     offerExtract(results.filter(r=>r.name.toLowerCase().endsWith(".zip")));
-    return;
-  }
-  const f=files[i];
-  openModal("Uploading…",
-    '<div class="up-name">'+esc(f.name)+'</div>'+
-    '<div class="bar"><div class="bar-fill" id="barFill"></div></div>'+
-    '<div class="up-count">'+(i+1)+' / '+files.length+'</div>');
-  uploadOne(f, p=>{ const b=$("#barFill"); if(b) b.style.width=(p*100).toFixed(1)+"%"; })
-    .then(r=>{ results.push(r); if(r.make) makeRuns.push({file:r.name, job:r.make.job}); uploadAll(files, i+1, results, makeRuns); })
-    .catch(err=>{ toast(f.name+": "+err.message, true); setTimeout(()=>uploadAll(files, i+1, results, makeRuns), 500); });
+  };
+  const pump=()=>{
+    while(active<UPLOAD_PARALLEL && i<files.length){
+      const f=files[i++]; active++;
+      uploadOne(f, bytes=>{ sent+=bytes; paint(); }, target)
+        .then(r=>{ results.push(r); if(r.make) makeRuns.push({file:r.name, job:r.make.job}); })
+        .catch(err=>{ failed.push(f.name); toast(f.name+": "+err.message, true); })
+        .then(()=>{ active--; done++; paint(); pump(); });
+    }
+    if(active===0 && i>=files.length) finish();
+  };
+  pump();
 }
+function uploadOne(file, onBytes, target){
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();
+    xhr.open("POST","api/upload?path="+encodeURIComponent(target||"")+"&filename="+encodeURIComponent(file.name));
+    xhr.responseType="text";
+    if(!autoMakeEnabled) xhr.setRequestHeader("X-FM-Auto-Make","0");
+    let last=0;
+    if(onBytes && xhr.upload){
+      // The server reports how many bytes landed; the bar wants increments so
+      // several uploads can share one total.
+      xhr.upload.onprogress=e=>{ if(e.lengthComputable){ onBytes(e.loaded-last); last=e.loaded; } };
+    }
+    xhr.onload=()=>{
+      let d=null; try{ d=JSON.parse(xhr.responseText); }catch(e){}
+      if(xhr.status>=200 && xhr.status<300) resolve(d||{});
+      else reject(new Error((d&&d.error)||(xhr.status+" "+xhr.statusText)));
+    };
+    xhr.onerror=()=>reject(new Error("Network error"));
+    xhr.send(file);
+  });
+}
+
+// -- Drag and drop upload ----------------------------------------------------
+// Only plain files are taken: a dropped folder would need the filesystem
+// entry API to read its contents, which is a lot of machinery for a dropped
+// tree, so it is reported instead.
+let dragNesting=0;  // dragenter/leave fire per element, so count them
+const isFileDrop = e => !!e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+document.addEventListener("dragenter", e=>{
+  if(!FEATURES.write || !isFileDrop(e)) return;
+  e.preventDefault(); dragNesting++; $("#drop").hidden=false;
+});
+document.addEventListener("dragover", e=>{
+  if(!FEATURES.write || !isFileDrop(e)) return;
+  e.preventDefault(); e.dataTransfer.dropEffect="copy";
+});
+document.addEventListener("dragleave", ()=>{
+  if(dragNesting>0) dragNesting--;
+  if(dragNesting===0) $("#drop").hidden=true;
+});
+document.addEventListener("drop", e=>{
+  dragNesting=0; $("#drop").hidden=true;
+  if(!FEATURES.write || !isFileDrop(e)) return;
+  e.preventDefault();
+  const items=[...(e.dataTransfer.items||[])];
+  const dirs=items.filter(it=>{
+    let entry=null;
+    try{ entry = it.webkitGetAsEntry ? it.webkitGetAsEntry() : null; }catch(err){}
+    return entry && entry.isDirectory;
+  }).map(it=>it.name||"?");
+  const files=[...(e.dataTransfer.files||[])].filter(f=>f.size>0 || f.type);
+  if(dirs.length) toast("Ignored "+dirs.join(", ")+": drop individual files, or zip the folder first", true);
+  if(files.length) uploadAll(files, state.path);
+});
 // -- Upload as base64 (workaround: encode in the browser, JSON over the wire)
 $("#files64").addEventListener("change", function(){
   const files=[...this.files]; this.value="";
-  if(files.length) uploadB64All(files, 0);
+  if(files.length) uploadB64All(files, 0, [], state.path);
 });
 function readB64(file){
   return new Promise((resolve,reject)=>{
@@ -2709,25 +3769,27 @@ function readB64(file){
     fr.readAsDataURL(file);
   });
 }
-function uploadB64All(files, i, makeRuns){
+function uploadB64All(files, i, makeRuns, target){
   if(!makeRuns) makeRuns=[];
   if(i>=files.length){
+    uploadBusy=false;
     toast("Upload complete");
-    closeModal(); load(state.path);
+    closeModal(true); load(state.path);
     if(makeRuns.length) pollMakeJobs("after upload (base64)", makeRuns);
     return;
   }
   const f=files[i];
-  openModal("Uploading (base64)…",
+  uploadBusy = true;
+  openModal("Uploading to "+folderLabel(target)+" (base64)…",
     '<div class="up-name">'+esc(f.name)+'</div>'+
     '<div class="bar"><div class="bar-fill" id="barFill64"></div></div>'+
     '<div class="up-count">'+(i+1)+' / '+files.length+'</div>');
   const fill=$("#barFill64"); if(fill) fill.style.width="100%";  // no byte progress: the file is fully read first
   readB64(f)
-    .then(b64=>api("api/upload64?path="+encodeURIComponent(state.path)+"&filename="+encodeURIComponent(f.name),
+    .then(b64=>api("api/upload64?path="+encodeURIComponent(target||"")+"&filename="+encodeURIComponent(f.name),
         { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ data: b64 }) }))
-    .then(r=>{ if(r.make) makeRuns.push({file:r.name, job:r.make.job}); uploadB64All(files, i+1, makeRuns); })
-    .catch(err=>{ toast(f.name+": "+err.message, true); setTimeout(()=>uploadB64All(files, i+1, makeRuns), 500); });
+    .then(r=>{ if(r.make) makeRuns.push({file:r.name, job:r.make.job}); uploadB64All(files, i+1, makeRuns, target); })
+    .catch(err=>{ toast(f.name+": "+err.message, true); setTimeout(()=>uploadB64All(files, i+1, makeRuns, target), 500); });
 }
 
 function offerExtract(zips){
@@ -2739,22 +3801,6 @@ function offerExtract(zips){
         { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({}) })
       .then(()=>{ toast("Extracted "+z.name); load(state.path); })
       .catch(err=>toast(z.name+": "+err.message, true));
-  });
-}
-function uploadOne(file, onProgress){
-  return new Promise((resolve,reject)=>{
-    const xhr=new XMLHttpRequest();
-    xhr.open("POST","api/upload?path="+encodeURIComponent(state.path)+"&filename="+encodeURIComponent(file.name));
-    xhr.responseType="text";
-    if(!autoMakeEnabled) xhr.setRequestHeader("X-FM-Auto-Make","0");
-    if(onProgress && xhr.upload) xhr.upload.onprogress=e=>{ if(e.lengthComputable) onProgress(e.loaded/e.total); };
-    xhr.onload=()=>{
-      let d=null; try{ d=JSON.parse(xhr.responseText); }catch(e){}
-      if(xhr.status>=200 && xhr.status<300) resolve(d||{});
-      else reject(new Error((d&&d.error)||(xhr.status+" "+xhr.statusText)));
-    };
-    xhr.onerror=()=>reject(new Error("Network error"));
-    xhr.send(file);
   });
 }
 
@@ -2877,7 +3923,8 @@ window.addEventListener("storage", e => {
   if(e.key === MAKE_KEY){ autoMakeEnabled = storedAutoMake(); applyMakeState(); }
 });
 
-// -- Startup feature flags (--no-shell / --no-run / --no-make / --no-b64) --
+// -- Startup feature flags (--no-shell / --no-run / --no-make / --no-b64 /
+// --read-only) --------------------------------------------------------------
 // The server enforces these too (the endpoints refuse with 403); this only
 // hides the corresponding UI so disabled features don't even appear.
 function applyFeatures(){
@@ -2886,12 +3933,19 @@ function applyFeatures(){
   hide("#makeBtn", FEATURES.make);
   hide("#makeRunBtn", FEATURES.make);
   hide("#upload64Btn", FEATURES.b64);
+  hide("#uploadBtn", FEATURES.write);
+  hide(".menu-wrap", FEATURES.write);  // the "+ New" menu creates things
+  const ro=$("#roBadge");
+  if(ro) ro.hidden = !!FEATURES.write;
+  if(!FEATURES.write) document.querySelectorAll(".c-sel").forEach(el=>el.style.display="none");
 }
+$("#filter").addEventListener("input", ev=>{ state.filter=ev.target.value; render(); });
+$("#filter").addEventListener("keydown", ev=>{ if(ev.key==="Escape"){ ev.target.value=""; state.filter=""; render(); } });
 
 applyFeatures();
 applyMakeState();
 applyTheme();
-load("");
+load(pathFromHash());
 updateSortIndicators();
 </script>
 </body>
@@ -2903,7 +3957,15 @@ updateSortIndicators();
 # Entry point
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> None:
-    global ROOT, ENABLE_SHELL, ENABLE_RUN, ENABLE_MAKE, ENABLE_B64
+    global ROOT, ENABLE_SHELL, ENABLE_RUN, ENABLE_MAKE, ENABLE_B64, ENABLE_WRITE
+    global SHELL_CMD, MAKE_CMD
+    # This file is run by whatever Python a user has on PATH, not by a project
+    # with a pinned requires-python, so the floor really is checked here.
+    if sys.version_info < (3, 10):  # noqa: UP036
+        sys.exit(
+            "filemanager.py needs Python 3.10 or newer "
+            f"(this is {sys.version.split()[0]})"
+        )
     ap = argparse.ArgumentParser(
         description="Single-file web file manager (stdlib + optional Pillow)."
     )
@@ -2919,6 +3981,13 @@ def main(argv: list[str] | None = None) -> None:
         help="bind address (default: 127.0.0.1; use 0.0.0.0 for a remote reverse proxy)",
     )
     ap.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
+    ap.add_argument(
+        "--read-only",
+        action="store_true",
+        help="refuse every change: no creating, editing, uploading, moving, "
+        "deleting, extracting or running (browsing, viewing and downloading "
+        "still work)",
+    )
     ap.add_argument(
         "--no-shell",
         action="store_true",
@@ -2939,6 +4008,23 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="disable the base64 upload/download workaround (/api/upload64, /api/download64)",
     )
+    ap.add_argument(
+        "--shell-cmd",
+        default=SHELL_CMD,
+        metavar="PROGRAM",
+        help=f"shell used by the Shell button (default: {SHELL_CMD})",
+    )
+    ap.add_argument(
+        "--make-cmd",
+        default=MAKE_CMD,
+        metavar="PROGRAM",
+        help=f"command used for make (default: {MAKE_CMD}; e.g. gmake, ninja)",
+    )
+    ap.add_argument(
+        "--version",
+        action="version",
+        version=f"filemanager.py {VERSION}",
+    )
     args = ap.parse_args(argv)
 
     root = Path(args.root or os.getcwd()).expanduser().resolve()
@@ -2949,6 +4035,9 @@ def main(argv: list[str] | None = None) -> None:
     ENABLE_RUN = not args.no_run
     ENABLE_MAKE = not args.no_make
     ENABLE_B64 = not args.no_b64
+    ENABLE_WRITE = not args.read_only
+    SHELL_CMD = args.shell_cmd
+    MAKE_CMD = args.make_cmd
     mimetypes.init()
 
     try:
@@ -2957,8 +4046,15 @@ def main(argv: list[str] | None = None) -> None:
         ap.error(f"could not bind {args.host}:{args.port} ({e})")
     server.daemon_threads = True  # don't block shutdown on stuck request threads
 
+    modes = ["read-only" if not ENABLE_WRITE else "read-write"]
+    if ENABLE_SHELL:
+        modes.append(f"shell={SHELL_CMD}")
+    if ENABLE_MAKE:
+        modes.append(f"make={MAKE_CMD}")
+    modes.append("thumbnails=on" if pillow_available() else "thumbnails=off (Pillow)")
     print(f"Serving: {ROOT}")
     print(f"URL:     http://{args.host}:{args.port}/")
+    print("Mode:    " + ", ".join(modes))
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
