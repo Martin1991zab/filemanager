@@ -15,8 +15,9 @@ with ordinary Linux tools. Folders show their recursive
 size; the listing shows created and last-updated times and can be sorted
 by name, size, or either timestamp; images get Pillow-generated
 thumbnails in the listing. The header holds only what is used every day
-(+ New, Upload); the less frequent actions — zip download of the current
-folder, base64 upload, make and the shell — are grouped in a Tools menu.
+(+ New, Upload, Upload & Extract); the less frequent actions — zip download
+of the current folder, base64 upload, make and the shell — are grouped in a
+Tools menu.
 If a Makefile is present in a directory,
 `make` is run there automatically in the background after files are
 edited, uploaded or deleted (a popup shows the result once the build
@@ -4245,6 +4246,7 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
     </div>
   </div>
   <button class="btn btn-primary" id="uploadBtn" type="button" title="Upload files into the current folder (press u)">Upload</button>
+  <button class="btn" id="uploadZipBtn" type="button" title="Upload zip files and extract them here (press z)"><span class="emoji">🗜️</span> Upload &amp; Extract</button>
   <div class="menu-wrap">
     <button class="btn" id="toolsBtn" type="button" aria-haspopup="menu" aria-controls="toolsMenu" aria-expanded="false" title="Zip download, base64 transfer, make and shell"><span class="emoji">⚙</span> Tools ▾<span class="dot" id="toolsDot" hidden title="Automatic make is off"></span></button>
     <div class="menu" id="toolsMenu" role="menu" hidden>
@@ -4264,6 +4266,7 @@ html[data-theme="dark"] .overlay{-webkit-backdrop-filter:blur(2px);backdrop-filt
   </div>
   <input type="file" id="files" multiple hidden>
   <input type="file" id="files64" multiple hidden>
+  <input type="file" id="filesZip" accept=".zip,application/zip" multiple hidden>
 </header>
 <main>
   <div class="meta" id="meta"></div>
@@ -5372,17 +5375,23 @@ const UPLOAD_PARALLEL = 3;  // uploads in flight at once
 // dialog.
 $("#uploadBtn").onclick=()=>$("#files").click();
 $("#upload64Btn").onclick=()=>$("#files64").click();
+$("#uploadZipBtn").onclick=()=>$("#filesZip").click();
 $("#files").addEventListener("change", function(){
   closeMenus();
   const files=[...this.files]; this.value="";
   if(files.length) uploadAll(files);
+});
+$("#filesZip").addEventListener("change", function(){
+  const files=[...this.files]; this.value="";
+  if(files.length) uploadAll(files, state.path, {autoExtract:true});
 });
 
 function folderLabel(rel){ return rel ? rel : ROOT_NAME; }
 
 // Uploads go to the folder that was open when they started: browsing around
 // while a big batch runs must not send the rest of it somewhere else.
-function uploadAll(files, target){
+function uploadAll(files, target, opts){
+  opts = opts || {};
   target = target == null ? state.path : target;
   uploadBusy = true;
   const totalBytes=files.reduce((n,f)=>n+f.size,0);
@@ -5405,7 +5414,10 @@ function uploadAll(files, target){
     if(failed.length) toast("Failed: "+failed.join(", "), true);
     else toast("Uploaded "+files.length+" file"+(files.length===1?"":"s")+" to "+folderLabel(target));
     if(makeRuns.length) pollMakeJobs("after upload", makeRuns);
-    offerExtract(results.filter(r=>r.name.toLowerCase().endsWith(".zip")));
+    if(opts.autoExtract){
+      const zips=results.filter(r=>r.name.toLowerCase().endsWith(".zip"));
+      if(zips.length) extractUploaded(zips);
+    }
   };
   const pump=()=>{
     while(active<UPLOAD_PARALLEL && i<files.length){
@@ -5556,16 +5568,20 @@ function uploadB64All(files, i, makeRuns, target){
     .catch(err=>{ toast(f.name+": "+err.message, true); setTimeout(()=>uploadB64All(files, i+1, makeRuns, target), 500); });
 }
 
-function offerExtract(zips){
-  if(!zips.length) return;
-  const names=zips.map(z=>'"'+z.name+'"').join(", ");
-  if(!confirm("Extract "+names+" in the current folder?")) return;
-  zips.forEach(z=>{
+// Extract zips that were just uploaded: one request each, listing reloads
+// once all of them are done. No confirmation — the user already chose this
+// by using the Upload & Extract button.
+function extractUploaded(zips){
+  let i=0;
+  (function step(){
+    if(i>=zips.length){ load(state.path); return; }
+    const z=zips[i++];
     api("api/extract?path="+encodeURIComponent(z.path),
         { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({}) })
-      .then(()=>{ toast("Extracted "+z.name); load(state.path); })
-      .catch(err=>toast(z.name+": "+err.message, true));
-  });
+      .then(()=>toast("Extracted "+z.name))
+      .catch(err=>toast(z.name+": "+err.message, true))
+      .then(step);
+  })();
 }
 
 // -- Theme: auto-detect (prefers-color-scheme) + manual toggle --------------
@@ -5716,14 +5732,15 @@ function helpHTML(){
 
   add("Create, upload, download", `
     <ul>
-      <li>The header keeps the two everyday actions in plain sight — <b>+ New</b>
-        (a folder or an empty text file) and <b>Upload</b> — and everything else is
-        under <b>⚙ Tools</b>. Files can also be dropped anywhere onto the page.
+      <li>The header keeps the everyday actions in plain sight — <b>+ New</b>
+        (a folder or an empty text file), <b>Upload</b> and <b>Upload &amp; Extract</b>
+        (picks a .zip, uploads it and unpacks it here in one step) — and everything
+        else is under <b>⚙ Tools</b>. Files can also be dropped anywhere onto the page.
         A folder can be dropped only on the WebDAV mount: a browser cannot send a
         whole tree in one request.</li>
       <li><b>Tools ▸ Download folder as zip</b> zips the folder you are looking at,
-        recursively. A .zip file has an <b>Extract</b> action, which unpacks it next
-        to itself or into a folder you pick.</li>
+        recursively. A .zip file also has an <b>Extract</b> action on its row, which
+        unpacks it next to itself or into a folder you pick.</li>
       <li><b>Download</b> is a plain streaming download that can be resumed.
         ${FEATURES.b64 ? `<b>🔣</b> transfers the same file as base64 inside JSON, which
         survives a proxy or VPN that mangles binary downloads; the reverse of it,
@@ -5774,6 +5791,7 @@ function helpHTML(){
       <span><kbd>/</kbd> filter box</span>
       <span><kbd>n</kbd> the + New menu</span>
       <span><kbd>u</kbd> upload</span>
+      <span><kbd>z</kbd> upload &amp; extract a zip</span>
       <span><kbd>↑</kbd><kbd>↓</kbd> inside an open menu</span>
       <span><kbd>Esc</kbd> close, clear</span>
       <span><kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+<kbd>S</kbd> save</span>
@@ -5918,11 +5936,16 @@ document.addEventListener("keydown", ev => {
   if(ev.key === "?"){ ev.preventDefault(); showHelp(); }
   else if(ev.key === "/"){ ev.preventDefault(); const f=$("#filter"); if(f) f.focus(); }
   // The header only keeps the two actions used most, so the rest stay
-  // reachable from the keyboard: n opens the menu they are in, u uploads.
+  // reachable from the keyboard: n opens the menu they are in, u uploads,
+  // z uploads a zip and extracts it.
   else if(ev.key === "n"){ ev.preventDefault(); openMenu("#newBtn"); }
   else if(ev.key === "u"){
     ev.preventDefault();
     if(FEATURES.write) $("#files").click();
+  }
+  else if(ev.key === "z"){
+    ev.preventDefault();
+    if(FEATURES.write) $("#filesZip").click();
   }
 });
 
@@ -5943,6 +5966,7 @@ function applyFeatures(){
   hide('[data-grp="run"]', runGroup);
   hide("#upload64Btn", FEATURES.b64);
   hide("#uploadBtn", FEATURES.write);
+  hide("#uploadZipBtn", FEATURES.write);
   hide("#newWrap", FEATURES.write);  // the "+ New" menu creates things
   const ro=$("#roBadge");
   if(ro) ro.hidden = !!FEATURES.write;
